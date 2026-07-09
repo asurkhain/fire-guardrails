@@ -185,6 +185,7 @@ def init_start_date_field(today_date, sim_start_key, start_date_key, start_date_
 
     previous_mode_key = "_previous_mode"
     is_historical = mode == "Historical Mode"
+    is_combo = mode == mode == "Combo Mode"
 
     if sim_start_key not in st.session_state:
         st.session_state[sim_start_key] = get_date_state(start_date_key, start_date_default)
@@ -194,7 +195,7 @@ def init_start_date_field(today_date, sim_start_key, start_date_key, start_date_
         if is_guidance:
             st.session_state[sim_start_key] = get_date_state(start_date_key, start_date_default)
             st.session_state[start_date_key] = today_date
-        elif is_historical:
+        elif is_combo or is_historical:
             st.session_state[sim_start_key] = get_date_state(start_date_key, start_date_default)
         else:
             restored_start = st.session_state.get(sim_start_key, start_date_default)
@@ -203,7 +204,7 @@ def init_start_date_field(today_date, sim_start_key, start_date_key, start_date_
             st.session_state[start_date_key] = restored_start
         st.session_state[previous_mode_key] = mode
 
-    if start_date_key not in st.session_state and not is_historical:
+    if start_date_key not in st.session_state and not (is_combo or is_historical):
         default_start = today_date if is_guidance else st.session_state.get(sim_start_key, start_date_default)
         if not isinstance(default_start, datetime.date):
             default_start = start_date_default
@@ -223,10 +224,6 @@ def initialize_display():
         st.session_state["cashflows"] = []
     if "conditional_cashflows" not in st.session_state:
         st.session_state["conditional_cashflows"] = []
-    if "_initial_spending_overridden" not in st.session_state:
-        st.session_state["_initial_spending_overridden"] = False
-    if "_initial_spending_auto_value" not in st.session_state:
-        st.session_state["_initial_spending_auto_value"] = None
     if "final_value_target" not in st.session_state:
         st.session_state["final_value_target"] = 100_000.0
     if "retirement_duration_years" not in st.session_state:
@@ -238,6 +235,14 @@ def initialize_display():
     if "final_value_target_ramp_down" not in st.session_state:
         st.session_state["final_value_target_ramp_down"] = True
     st.session_state.pop("historical_parallel_backend", None)
+    if "stock_pct_range" not in st.session_state:
+        st.session_state["stock_pct_range"] = (0.50, 0.90)
+    if "upper_guardrail_success_range" not in st.session_state:
+        st.session_state["upper_guardrail_success_range"] = (0.80, 1.00)
+    if "lower_guardrail_success_range" not in st.session_state:
+        st.session_state["lower_guardrail_success_range"] = (0.25, 0.45)
+    if "target_success_rate_range" not in st.session_state:
+        st.session_state["target_success_rate_range"] = (0.70, 0.90)
     if "initial_portfolio_value" not in st.session_state:
         st.session_state["initial_portfolio_value"] = 1_000_000.0
     if "fixed_yearly_withdrawal_input" not in st.session_state:
