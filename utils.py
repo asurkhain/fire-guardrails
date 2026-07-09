@@ -123,6 +123,7 @@ def _build_historical_worker_context(
     all_stock_prices = analysis_df["Real Total Return Price"].to_numpy(dtype=float)
     all_bond_prices = analysis_df["Real Total Bond Returns"].to_numpy(dtype=float)
     portfolio_returns = compute_portfolio_returns(all_stock_prices, all_bond_prices, settings.stock_pct)
+    print(f"[DEBUG] Building context stock_pct={settings.stock_pct} portfolio_returns[:5]={portfolio_returns[:5].tolist()}")
     all_cape_values = analysis_df["CAPE"].to_numpy(dtype=float)
     analysis_df.to_pickle(analysis_df_path)
     dump(np.ascontiguousarray(all_stock_prices), all_stock_prices_path)
@@ -1101,11 +1102,13 @@ def simulate_fixed_withdrawal_retirement(
 def _run_single_retirement_task(start, context_spec: HistoricalWorkerContext | None = None) -> dict:
     """Run a single historical retirement simulation."""
     context = _HISTORICAL_WORKER_CONTEXT
-    if context is None:
-        if context_spec is None:
-            raise RuntimeError("Historical worker context has not been initialized.")
+    if context_spec is not None and (
+        context is None or context.portfolio_returns_path != context_spec.portfolio_returns_path
+    ):
         context = _materialize_historical_worker_context(context_spec)
         _set_historical_worker_context(context)
+    elif context is None:
+        raise RuntimeError("Historical worker context has not been initialized.")
 
     df = context.analysis_df
     settings = context.settings
@@ -1219,6 +1222,99 @@ def _run_single_retirement_task(start, context_spec: HistoricalWorkerContext | N
 
 NUM_CORES = 8  # Code configurable number of CPU cores. Set to 1 to run sequentially.
 
+def run_combo_analysis(
+        df: pd.DataFrame,
+        settings: Settings,
+        stock_pct_range: tuple[float, float],
+        upper_guardrail_success_range: tuple[float, float],
+        lower_guardrail_success_range: tuple[float, float],
+        target_success_rate_range: tuple[float, float],
+        on_progress=None,
+        on_status=None,
+) -> dict[str, pd.DataFrame]:
+
+    step = 0.05
+    stock_pct_min, stock_pct_max = stock_pct_range
+    ugr_min, ugr_max = upper_guardrail_success_range
+    lgr_min, lgr_max = lower_guardrail_success_range
+    tsr_min, tsr_max = target_success_rate_range
+
+    # Generate independent value lists for each parameter
+    stock_pct_values = np.round(np.arange(stock_pct_min, stock_pct_max + step, step), 2).tolist()
+    ugr_values = np.round(np.arange(ugr_min, ugr_max + step, step), 2).tolist()
+    lgr_values = np.round(np.arange(lgr_min, lgr_max + step, step), 2).tolist()
+    tsr_values = np.round(np.arange(tsr_min, tsr_max + step, step), 2).tolist()
+
+    # Filter to range bounds (arange can overshoot due to float rounding)
+    stock_pct_values = [v for v in stock_pct_values if stock_pct_min <= v <= stock_pct_max]
+    ugr_values = [v for v in ugr_values if ugr_min <= v <= ugr_max]
+    lgr_values = [v for v in lgr_values if lgr_min <= v <= lgr_max]
+    tsr_values = [v for v in tsr_values if tsr_min <= v <= tsr_max]
+
+    # Build all valid combinations: lgr < tsr < ugr
+    combos = []
+    for sp in stock_pct_values:
+        for ugr in ugr_values:
+            for lgr in lgr_values:
+                for tsr in tsr_values:
+                    if not (lgr < tsr < ugr):
+                        continue
+                    combos.append((sp, ugr, lgr, tsr))
+
+    total = len(combos)
+    results: dict[str, pd.DataFrame] = {}
+    idx = 0
+
+    for sp, ugr, lgr, tsr in combos:
+        combo_settings = Settings(
+            mode=settings.mode,
+            start_date=settings.start_date,
+            retirement_duration_months=settings.retirement_duration_months,
+            analysis_start_date=settings.analysis_start_date,
+            initial_value=settings.initial_value,
+            stock_pct=sp,
+            target_success_rate=tsr,
+            initial_monthly_spending=settings.initial_monthly_spending,
+            initial_spending_overridden=settings.initial_spending_overridden,
+            upper_guardrail_success=ugr,
+            lower_guardrail_success=lgr,
+            upper_adjustment_fraction=settings.upper_adjustment_fraction,
+            lower_adjustment_fraction=settings.lower_adjustment_fraction,
+            adjustment_threshold=settings.adjustment_threshold,
+            adjustment_frequency=settings.adjustment_frequency,
+            spending_cap_option=settings.spending_cap_option,
+            spending_floor_option=settings.spending_floor_option,
+            shiller_extension_mode=settings.shiller_extension_mode,
+            final_value_target=settings.final_value_target,
+            final_value_target_ramp_down=settings.final_value_target_ramp_down,
+            fixed_monthly_withdrawal=settings.fixed_monthly_withdrawal,
+            historical_future_extension_years=settings.historical_future_extension_years,
+            cashflows=list(settings.cashflows),
+            conditional_cashflows=list(settings.conditional_cashflows),
+        )
+
+        key = f"sp={sp:.0%}_ugr={ugr:.0%}_lgr={lgr:.0%}_tsr={tsr:.0%}"
+        print(f"[DEBUG] Combo iteration stock_pct={sp}")
+
+        def _combo_progress(current, total_inner):
+            if on_progress is not None and total > 0:
+                combo_fraction = current / total_inner if total_inner > 0 else 0
+                on_progress(idx + combo_fraction, total)
+
+        def _combo_status(msg):
+            if on_status is not None:
+                on_status(f"[{key}] {msg}")
+
+        result_df = run_historical_retirements_analysis(
+            df=df,
+            settings=combo_settings,
+            on_progress=_combo_progress,
+            on_status=_combo_status,
+        )
+        results[key] = result_df
+        idx += 1
+
+    return results
 
 def run_historical_retirements_analysis(
     df: pd.DataFrame,
@@ -1272,6 +1368,7 @@ def run_historical_retirements_analysis(
                         on_progress(idx + 1, total)
             finally:
                 _set_historical_worker_context(None)
+            del parallel
 
             # Sort rows by Start_Year to maintain chronological order in charts and tables
             rows.sort(key=lambda r: r["Start_Year"])
@@ -1294,6 +1391,23 @@ def run_historical_retirements_analysis(
             shutil.rmtree(temp_dir, ignore_errors=True)
 
     return pd.DataFrame(rows)
+
+
+def get_combo_tempdir() -> str:
+    """Return the temp directory used for combo result files, creating it if needed."""
+    d = Path(tempfile.gettempdir()) / "fire-guardrails-combo"
+    d.mkdir(parents=True, exist_ok=True)
+    return str(d)
+
+
+def save_combo_results(results: dict[str, pd.DataFrame], path: str) -> None:
+    """Save combo results dict {key -> DataFrame} to a file via joblib."""
+    dump(results, path)
+
+
+def load_combo_results(path: str) -> dict[str, pd.DataFrame]:
+    """Load combo results dict {key -> DataFrame} previously saved with save_combo_results."""
+    return load(path)
 
 
 def compute_guardrail_guidance_snapshot(

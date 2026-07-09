@@ -149,9 +149,7 @@ def update_guardrail_dynamic_labels(gr_params: dict, cashflows: list):
 
 
 def update_initial_spending_label(initial_spending: float,
-                                  initial_value: float,
-                                  auto_spending: Optional[float],
-                                  overridden: bool) -> None:
+                                  initial_value: float) -> None:
     """Compute the dynamic label text and color for the Initial Yearly Spending control."""
 
     spending_rate = None
@@ -163,17 +161,8 @@ def update_initial_spending_label(initial_spending: float,
     else:
         label_text = "Initial Yearly Spending (SR: N/A)"
 
-    label_color = None
-    if overridden and auto_spending is not None:
-        if np.isclose(initial_spending, auto_spending, rtol=0.0, atol=6.0):
-            label_color = None
-        elif initial_spending > auto_spending:
-            label_color = "#d62728"
-        else:
-            label_color = "#2ca02c"
-
     st.session_state['initial_spending_label_text'] = label_text
-    st.session_state['initial_spending_label_color'] = label_color
+    #st.session_state['initial_spending_label_color'] = label_color
 
 
 def render_simulation_results(
@@ -612,7 +601,7 @@ def render_simulation_results(
             return "N/A"
         return f"{(new_value / baseline - 1.0):+.0%}"
 
-    # Baseline for "Duration Below Initial Withdrawal": compare against Fixed Yearly
+    # Baseline for "Duration Below": compare against Fixed Yearly
     # Withdrawal if provided, otherwise fall back to the initial spending amount.
     baseline_comparison = (
         float(fixed_monthly_withdrawal)
@@ -643,7 +632,7 @@ def render_simulation_results(
                 "VPW": _fmt_currency(avg_yearly_vpw_spending) if has_vpw else "N/A",
             },
             {
-                "Metric": "Duration Below Initial Withdrawal",
+                "Metric": "Duration Below",
                 "Fixed": f"{pct_below_fixed:.1%}",
                 "Guardrails": f"{pct_below_guardrails:.1%}",
                 "% Diff": "—",
@@ -666,7 +655,7 @@ def render_simulation_results(
                 "VPW": _fmt_currency(avg_yearly_vpw_spending) if has_vpw else "N/A",
             },
             {
-                "Metric": "Duration Below Initial Withdrawal",
+                "Metric": "Duration Below",
                 "Guardrails": f"{pct_below_guardrails:.1%}",
                 "CAPE": f"{pct_below_cape:.1%}" if has_cape else "N/A",
                 "VPW": f"{pct_below_vpw:.1%}" if has_vpw else "N/A",
@@ -772,6 +761,289 @@ def _percentile_summary(series: pd.Series, label: str, is_pct: bool = False) -> 
         "Mean": fmt(float(clean.mean())),
     }
 
+def render_combo_results(
+        results_dict: dict[str, pd.DataFrame],
+        calculation_time_seconds: Optional[float] = None,
+        fixed_monthly_withdrawal: Optional[float] = None,
+) -> None:
+    if not results_dict:
+        st.info("No combo results to display.")
+        return
+
+    yearly_scale = float(MONTHS_PER_YEAR)
+
+    st.subheader("Combo Analysis Results")
+    if calculation_time_seconds is not None:
+        elapsed = max(float(calculation_time_seconds), 0.0)
+        minutes, seconds = divmod(elapsed, 60.0)
+        hours, minutes = divmod(int(minutes), 60)
+        if hours:
+            elapsed_text = f"{hours:d}h {minutes:02d}m {seconds:04.1f}s"
+        elif minutes:
+            elapsed_text = f"{minutes:d}m {seconds:04.1f}s"
+        else:
+            elapsed_text = f"{seconds:0.1f}s"
+        st.caption(f"Calculation time: {elapsed_text}")
+
+    st.caption(f"Parameter combinations: {len(results_dict)}")
+    first_df = next(iter(results_dict.values()), None)
+    if first_df is not None:
+        st.caption(f"Number of historical retirement periods per combination: {len(first_df)}")
+
+    rows = []
+    vpw_by_sp: dict[str, list] = {}
+    for key, result_df in results_dict.items():
+        try:
+            parts = key.split("_")
+            sp = float(parts[0].replace("sp=", "").replace("%", "")) / 100.0
+            ugr = float(parts[1].replace("ugr=", "").replace("%", "")) / 100.0
+            lgr = float(parts[2].replace("lgr=", "").replace("%", "")) / 100.0
+            tsr = float(parts[3].replace("tsr=", "").replace("%", "")) / 100.0
+        except (ValueError, IndexError):
+            continue
+
+        if result_df is None or result_df.empty:
+            rows.append({
+                "Stock %": f"{sp:.0%}",
+                "Upper GR": f"{ugr:.0%}",
+                "Target SR": f"{tsr:.0%}",
+                "Lower GR": f"{lgr:.0%}",
+                "GR Success": "N/A",
+                "N Runs": 0,
+            })
+            continue
+
+        try:
+            guardrail_success = float(result_df["Guardrail_Success"].mean())
+        except Exception:
+            guardrail_success = 0.0
+
+        has_fixed = fixed_monthly_withdrawal is not None and "Fixed_Success" in result_df.columns
+        fixed_success = float(result_df["Fixed_Success"].mean()) if has_fixed else None
+
+        try:
+            avg_sp_val = pd.to_numeric(result_df.get("avg_spending", pd.Series(dtype=float)), errors="coerce").mean()
+            avg_spending = float(avg_sp_val) * yearly_scale if not pd.isna(avg_sp_val) else None
+        except Exception:
+            avg_spending = None
+
+        try:
+            med_sp_val = pd.to_numeric(result_df.get("median_spending", pd.Series(dtype=float)), errors="coerce").mean()
+            median_spending = float(med_sp_val) * yearly_scale if not pd.isna(med_sp_val) else None
+        except Exception:
+            median_spending = None
+
+        try:
+            min_sp_val = pd.to_numeric(result_df.get("min_spending", pd.Series(dtype=float)), errors="coerce").mean()
+            min_spending = float(min_sp_val) * yearly_scale if not pd.isna(min_sp_val) else None
+        except Exception:
+            min_spending = None
+        try:
+            max_sp_val = pd.to_numeric(result_df.get("max_spending", pd.Series(dtype=float)), errors="coerce").mean()
+            max_spending = float(max_sp_val) * yearly_scale if not pd.isna(max_sp_val) else None
+        except Exception:
+            max_spending = None
+
+        try:
+            pct_below_val = pd.to_numeric(result_df.get("pct_below_initial", pd.Series(dtype=float)), errors="coerce").mean()
+            pct_below = float(pct_below_val) if not pd.isna(pct_below_val) else None
+        except Exception:
+            pct_below = None
+
+        try:
+            sorted_result = result_df.sort_values(
+                by=["pct_below_initial", "min_spending"],
+                ascending=[False, True]
+            ).reset_index(drop=True)
+            N_runs = len(sorted_result)
+
+            def _pct_at_q(col, q):
+                if N_runs == 0:
+                    return None
+                idx = int(q * (N_runs - 1))
+                val = sorted_result.iloc[idx][col]
+                return float(val) if pd.notna(val) else None
+
+            pct_below_10 = _pct_at_q("pct_below_initial", 0.10)
+            pct_below_25 = _pct_at_q("pct_below_initial", 0.25)
+            pct_below_50 = _pct_at_q("pct_below_initial", 0.50)
+        except Exception:
+            pct_below_10 = pct_below_25 = pct_below_50 = None
+
+        # VPW metrics
+        try:
+            vpw_success = float(pd.to_numeric(result_df.get("VPW_Success", pd.Series(dtype=float)), errors="coerce").mean())
+        except Exception:
+            vpw_success = None
+        try:
+            vpw_avg = float(pd.to_numeric(result_df.get("VPW_Average_Withdrawal", pd.Series(dtype=float)), errors="coerce").mean())
+        except Exception:
+            vpw_avg = None
+        try:
+            vpw_median = float(pd.to_numeric(result_df.get("VPW_Median_Withdrawal", pd.Series(dtype=float)), errors="coerce").mean())
+        except Exception:
+            vpw_median = None
+        try:
+            vpw_min = float(pd.to_numeric(result_df.get("VPW_Minimum_Withdrawal", pd.Series(dtype=float)), errors="coerce").mean())
+        except Exception:
+            vpw_min = None
+        try:
+            vpw_max = float(pd.to_numeric(result_df.get("VPW_Maximum_Withdrawal", pd.Series(dtype=float)), errors="coerce").mean())
+        except Exception:
+            vpw_max = None
+        try:
+            vpw_pct_below = float(pd.to_numeric(result_df.get("VPW_Pct_Below_Fixed", pd.Series(dtype=float)), errors="coerce").mean())
+        except Exception:
+            vpw_pct_below = None
+
+        try:
+            vpw_pct_below_10 = _pct_at_q("VPW_Pct_Below_Fixed", 0.10)
+            vpw_pct_below_25 = _pct_at_q("VPW_Pct_Below_Fixed", 0.25)
+            vpw_pct_below_50 = _pct_at_q("VPW_Pct_Below_Fixed", 0.50)
+        except Exception:
+            vpw_pct_below_10 = vpw_pct_below_25 = vpw_pct_below_50 = None
+
+        sp_key = f"{sp:.0%}"
+        rows.append({
+            "Stock %": sp_key,
+            "Upper GR": f"{ugr:.0%}",
+            "Target SR": f"{tsr:.0%}",
+            "Lower GR": f"{lgr:.0%}",
+            "GR Success": guardrail_success * 100, #f"{guardrail_success:.1%}",
+            "Fixed Success": fixed_success * 100 if fixed_success is not None else np.nan, #f"{fixed_success:.1%}" if fixed_success is not None else "N/A",
+            "Mean Avg": _fmt_currency(avg_spending) if avg_spending is not None else "N/A",
+            "Mean Median": _fmt_currency(median_spending) if median_spending is not None else "N/A",
+            "Mean Min": _fmt_currency(min_spending) if min_spending is not None else "N/A",
+            "Mean Max": max_spending, #_fmt_currency(min_spending) if min_spending is not None else "N/A",
+
+            "Below Fixed 10th": pct_below_10 * 100 if pct_below_10 is not None else np.nan, # f"{pct_below_10:04.1%}" if pct_below_10 is not None else "N/A",
+            "Below Fixed 25th": pct_below_25 * 100 if pct_below_25 is not None else np.nan, #f"{pct_below_25:04.1%}" if pct_below_25 is not None else "N/A",
+            "Below Fixed 50th": pct_below_50 * 100 if pct_below_50 is not None else np.nan, #f"{pct_below_50:04.1%}" if pct_below_50 is not None else "N/A",
+            "Below Fixed Mean": pct_below * 100 if pct_below is not None else np.nan, #f"{pct_below:04.1%}" if pct_below is not None else "N/A",
+        })
+
+        # Accumulate by stock pct for the VPW aggregate table
+        vpw_by_sp.setdefault(sp_key, []).append({
+            "vpw_avg": vpw_avg,
+            "vpw_median": vpw_median,
+            "vpw_min": vpw_min,
+            "vpw_max": vpw_max,
+            "vpw_success": vpw_success,
+            "vpw_pct_below": vpw_pct_below,
+            "vpw_pct_below_10": vpw_pct_below_10,
+            "vpw_pct_below_25": vpw_pct_below_25,
+            "vpw_pct_below_50": vpw_pct_below_50,
+        })
+
+    if not rows:
+        st.info("No valid combination results to display.")
+        return
+
+    summary_df = pd.DataFrame(rows)
+    st.markdown("**Per-combination summary**")
+    sorted_df = summary_df.sort_values(
+        by=["Below Fixed 50th", "Below Fixed 25th", "Below Fixed 10th"],
+        ascending=[True, True, True]
+    )
+    config_dict = {}
+    for name in ["Mean Avg", "Mean Median", "Mean Min", "Mean Max"]:
+        if name in sorted_df.columns:
+            config_dict[name] = st.column_config.NumberColumn(format="dollar")
+    for name in ["GR Success", "Fixed Success", "Below Fixed 10th", "Below Fixed 25th", "Below Fixed 50th", "Below Fixed Mean"]:
+        if name in sorted_df.columns:
+            config_dict[name] = st.column_config.NumberColumn(
+                name,
+                format="%.1f%%",
+            )
+    st.dataframe(sorted_df, use_container_width=True, hide_index=True,
+                 column_config=config_dict)
+
+    # VPW aggregate table: one row per stock percentage
+    if vpw_by_sp:
+        st.markdown("**VPW Summary by Stock %**")
+        vpw_rows = []
+        for sp_key, entries in sorted(vpw_by_sp.items(), key=lambda x: float(x[0].rstrip("%")) / 100):
+            vals = [e for e in entries if e["vpw_avg"] is not None]
+            if not vals:
+                continue
+            avg_avg = np.mean([e["vpw_avg"] for e in vals])
+            avg_median = np.mean([e["vpw_median"] for e in vals])
+            avg_min = np.mean([e["vpw_min"] for e in vals])
+            avg_max = np.mean([e["vpw_max"] for e in vals])
+            avg_success = np.mean([e["vpw_success"] for e in vals if e["vpw_success"] is not None])
+            avg_pct_below = np.mean([e["vpw_pct_below"] for e in vals if e["vpw_pct_below"] is not None])
+            vals_pct10 = [e["vpw_pct_below_10"] for e in vals if e["vpw_pct_below_10"] is not None]
+            vals_pct25 = [e["vpw_pct_below_25"] for e in vals if e["vpw_pct_below_25"] is not None]
+            vals_pct50 = [e["vpw_pct_below_50"] for e in vals if e["vpw_pct_below_50"] is not None]
+            avg_pct_below_10 = np.mean(vals_pct10) if vals_pct10 else None
+            avg_pct_below_25 = np.mean(vals_pct25) if vals_pct25 else None
+            avg_pct_below_50 = np.mean(vals_pct50) if vals_pct50 else None
+            vpw_rows.append({
+                "Stock %": sp_key,
+                "Avg Spend": avg_avg, #_fmt_currency(avg_avg),
+                "Median Spend": avg_median, #_fmt_currency(avg_median),
+                "Min Spend": avg_min, #_fmt_currency(avg_min),
+                "Max Spend": avg_max, #_fmt_currency(avg_max),
+                "Success Rate": avg_success * 100, #f"{avg_success:.1%}",
+                "Below Fixed 10th": avg_pct_below_10 * 100 if avg_pct_below_10 is not None else np.nan, #f"{avg_pct_below_10:.1%}" if avg_pct_below_10 is not None else "N/A",
+                "Below Fixed 25th": avg_pct_below_25 * 100 if avg_pct_below_25 is not None else np.nan, #f"{avg_pct_below_25:.1%}" if avg_pct_below_25 is not None else "N/A",
+                "Below Fixed 50th": avg_pct_below_50 * 100 if avg_pct_below_50 is not None else np.nan, #f"{avg_pct_below_50:.1%}" if avg_pct_below_50 is not None else "N/A",
+                "Below Fixed Mean": avg_pct_below * 100 if avg_pct_below is not None else np.nan, #f"{avg_pct_below:.1%}" if avg_pct_below is not None else "N/A",
+            })
+        if vpw_rows:
+            df_to_show = pd.DataFrame(vpw_rows).set_index("Stock %")
+            config_dict = {}
+            for name in ["Avg Spend", "Median Spend", "Min Spend", "Max Spend"]:
+                if name in df_to_show.columns:
+                    config_dict[name] = st.column_config.NumberColumn(format="dollar")
+            for name in ["Success Rate", "Below Fixed 10th", "Below Fixed 25th", "Below Fixed 50th", "Below Fixed Mean"]:
+                if name in df_to_show.columns:
+                    config_dict[name] = st.column_config.NumberColumn(
+                        name,
+                        format="%.1f%%",
+                    )
+
+            st.dataframe(df_to_show, use_container_width=True, column_config=config_dict)
+
+    # Heatmap: pivot pct_below_initial over stock_pct x target_success_rate
+    try:
+        valid = [r for r in rows if r["Below Fixed Mean"] != "N/A"]
+        stock_vals = sorted(set(r["Stock %"] for r in valid), key=lambda x: float(x.strip("%")) / 100)
+        tsr_vals = sorted(set(r["Target SR"] for r in valid), key=lambda x: float(x.strip("%")) / 100)
+        lookup = {(r["Stock %"], r["Target SR"]): float(r["Below Fixed Mean"].rstrip("%")) / 100.0 for r in valid}
+
+        if len(stock_vals) > 1 and len(tsr_vals) > 1:
+            st.markdown("**Duration Below by Stock % and Target Success Rate**")
+            heat_data = []
+            for tsr in tsr_vals:
+                row_data = []
+                for sp in stock_vals:
+                    val = lookup.get((sp, tsr))
+                    row_data.append(val if val is not None else None)
+                heat_data.append(row_data)
+
+            fig = go.Figure(data=go.Heatmap(
+                z=heat_data,
+                x=stock_vals,
+                y=tsr_vals,
+                text=[[f"{v:.1%}" if v is not None else "" for v in row] for row in heat_data],
+                texttemplate="%{text}",
+                colorscale="RdYlGn_r",
+                zmin=0.0,
+                zmax=1.0,
+                colorbar=dict(title="Below Initial"),
+            ))
+            fig.update_layout(
+                title="Duration Below",
+                xaxis_title="Stock %",
+                yaxis_title="Target Success Rate",
+                height=500,
+                margin=dict(l=10, r=10, t=60, b=40),
+            )
+            st.plotly_chart(fig, use_container_width=True)
+    except Exception as e:
+        print(f"Error building heatmap: {e}")
+        pass
 
 def render_historical_results(
     results_df: pd.DataFrame,
@@ -990,7 +1262,7 @@ def render_historical_results(
         build_percentile_row("max_spending", "Max Yearly Spending", scale=yearly_scale),
         build_percentile_row("median_spending", "Median Yearly Spending", scale=yearly_scale),
         build_percentile_row("avg_spending", "Average Yearly Spending", scale=yearly_scale),
-        build_percentile_row("pct_below_initial", "Duration Below Initial Withdrawal", is_pct=True),
+        build_percentile_row("pct_below_initial", "Duration Below", is_pct=True),
     ]
 
     if has_cape:
@@ -999,7 +1271,7 @@ def render_historical_results(
             build_percentile_row("CAPE_Maximum_Withdrawal", "CAPE Max Yearly Spending"),
             build_percentile_row("CAPE_Median_Withdrawal", "CAPE Median Yearly Spending"),
             build_percentile_row("CAPE_Average_Withdrawal", "CAPE Average Yearly Spending"),
-            build_percentile_row("CAPE_Pct_Below_Fixed", "CAPE Duration Below Initial Withdrawal", is_pct=True),
+            build_percentile_row("CAPE_Pct_Below_Fixed", "CAPE Duration Below", is_pct=True),
         ])
     if has_vpw:
         percentile_rows.extend([
@@ -1007,7 +1279,7 @@ def render_historical_results(
             build_percentile_row("VPW_Maximum_Withdrawal", "VPW Max Yearly Spending"),
             build_percentile_row("VPW_Median_Withdrawal", "VPW Median Yearly Spending"),
             build_percentile_row("VPW_Average_Withdrawal", "VPW Average Yearly Spending"),
-            build_percentile_row("VPW_Pct_Below_Fixed", "VPW Duration Below Initial Withdrawal", is_pct=True),
+            build_percentile_row("VPW_Pct_Below_Fixed", "VPW Duration Below", is_pct=True),
         ])
 
     percentile_rows.append(build_percentile_row("Guardrail_Success", "Guardrail Failure %", is_pct_flipped=True))
@@ -1112,7 +1384,7 @@ def render_historical_results(
             )
         )
     fig_duration.update_layout(
-        title="Percentage of Duration Below Initial Withdrawal by Start Year",
+        title="Percentage of Duration Below by Start Year",
         xaxis_title="Retirement Start Year",
         yaxis_title="Duration Below Initial (%)",
         yaxis=dict(ticksuffix="%"),
@@ -1301,11 +1573,11 @@ def render_historical_results(
         "VPW Median Withdrawal",
     ]:
         if name in display_df.columns:
-            column_config[name] = st.column_config.NumberColumn(format="$%.0f")
+            column_config[name] = st.column_config.NumberColumn(format="dollar") #format="$%.0f")
 
     for name in ["GR Below Fixed (%)", "CAPE Below Fixed (%)", "VPW Below Fixed (%)"]:
         if name in display_df.columns:
-            column_config[name] = st.column_config.NumberColumn(format="%.1f")
+            column_config[name] = st.column_config.NumberColumn(format="%.1f%%")
 
 
 

@@ -1,5 +1,7 @@
 import datetime
+import os
 import traceback
+from pathlib import Path
 from time import perf_counter
 from typing import Optional
 
@@ -24,7 +26,7 @@ if st.runtime.exists():
     # Mode toggle (top, persistent)
     mode = st.radio(
         "Mode",
-        ["Simulation Mode", "Historical Mode", "Guidance Mode"],
+        ["Simulation Mode", "Historical Mode", "Combo Mode", "Guidance Mode"],
         index=0,
         horizontal=True,
         key="app_mode",
@@ -33,6 +35,7 @@ if st.runtime.exists():
     is_guidance = (mode == "Guidance Mode")
     is_historical = (mode == "Historical Mode")
     is_simulation = (mode == "Simulation Mode")
+    is_combo = (mode == "Combo Mode")
 
     controls.initialize_display()
 
@@ -49,14 +52,6 @@ if st.runtime.exists():
             style += f" color: {color};"
         st.sidebar.markdown(f"<div style=\"{style}\">{text}</div>", unsafe_allow_html=True)
 
-    def _mark_initial_spending_overridden() -> None:
-        """Flag that the current spending widget has been manually overridden."""
-        st.session_state["_initial_spending_overridden"] = True
-
-    def _unmark_initial_spending_overridden() -> None:
-        """Flag that the current spending widget is no longer being manually overridden."""
-        st.session_state["_initial_spending_overridden"] = False
-
     # Sidebar for inputs
     st.sidebar.header("Simulation Parameters")
 
@@ -71,7 +66,7 @@ if st.runtime.exists():
     sim_start_key = "_simulation_retirement_start_date"
     controls.init_start_date_field(today_date, sim_start_key, start_date_key, start_date_default, mode, is_guidance)
 
-    if not is_historical:
+    if not is_historical and not is_combo:
         start_date = st.sidebar.date_input(
             "Retirement Start Date",
             min_value=datetime.date(1871, 1, 1),
@@ -81,7 +76,6 @@ if st.runtime.exists():
                  "In Guidance Mode, this defaults to today. Even if retirement is already underway, the guidance is forward looking from today.\n\n"
                  "(Hint: You can type the date in YYYY/MM/DD format instead of choosing it from the selector, which may be faster.)",
             disabled=is_guidance,
-            on_change=_unmark_initial_spending_overridden,
             key=start_date_key,
         )
     else:
@@ -93,14 +87,13 @@ if st.runtime.exists():
         start_date = controls.get_date_state(start_date_key, start_date_default)
         st.session_state[sim_start_key] = start_date
 
-    if is_historical:
+    if is_historical or is_combo:
         retirement_duration_years = st.sidebar.number_input(
             "Retirement Duration (years)",
             value=controls.get_int_state("retirement_duration_years", 50),
             min_value=1,
             max_value=100,
             step=1,
-            on_change=_unmark_initial_spending_overridden,
             key="retirement_duration_years_hist",
             help="Length of each historical retirement in whole years. Every January 1 from the Historical Analysis Start Date "
                  "through the latest year that fits in the Shiller dataset is used as a retirement start.",
@@ -118,7 +111,6 @@ if st.runtime.exists():
             min_value=0,
             max_value=100,
             step=1,
-            on_change=_unmark_initial_spending_overridden,
             key="historical_future_extension_years",
             help="Repeats the last 12 months of Shiller data forward for this many years before stopping. "
                  "Set to 0 to keep the current end-of-data cutoff behavior.",
@@ -130,7 +122,6 @@ if st.runtime.exists():
             min_value=1,
             max_value=100,
             step=1,
-            on_change=_unmark_initial_spending_overridden,
             key="retirement_duration_years_sim",
             help="Length of retirement in years.\n\nIn Guidance Mode, this should be the remaining number of years, if retirement is already underway."
         )
@@ -159,13 +150,12 @@ if st.runtime.exists():
             else:
                 notice_ph.empty()
 
-    if is_historical:
+    if is_historical or is_combo:
         analysis_start_date = st.sidebar.date_input(
             "Historical Analysis Start Date",
             value=controls.get_date_state("analysis_start_date", datetime.date(1871, 1, 1)),
             min_value=datetime.date(1871, 1, 1),
             max_value=datetime.date.today(),
-            on_change=_unmark_initial_spending_overridden,
             help="Earliest date for historical data included to estimate success rates (Shiller data begins in 1871).\n\nCurrently, only the year and month "
                  "are used, due to the monthly nature of the Shiller dataset. The day of the month is ignored.\n\nNote that when running historical "
                  "simulations, each month's guardrails will be recalculated based on the historical data available between this start date and that month "
@@ -185,21 +175,32 @@ if st.runtime.exists():
         "Initial Portfolio Value",
         min_value=100_000.0,
         step=100_000.0,
-        on_change=_unmark_initial_spending_overridden,
         key="initial_portfolio_value",
         help="Starting portfolio balance in dollars at retirement."
     )
 
-    stock_pct = st.sidebar.slider(
-        "Stock Percentage",
-        value=controls.get_float_state("stock_pct", 0.90),
-        min_value=0.0,
-        max_value=1.0,
-        step=0.01,
-        on_change=_unmark_initial_spending_overridden,
-        key="stock_pct",
-        help="Fraction of the portfolio allocated to US stocks; remainder to 10Y treasuries."
-    )
+    if is_combo:
+        stock_pct_range = st.sidebar.slider(
+            "Stock Percentage Range",
+            value=st.session_state.get("stock_pct_range", (0.50, 0.90)),
+            min_value=0.0,
+            max_value=1.0,
+            step=0.05,
+            key="stock_pct_range",
+            help="Range of stock allocation to test across simulations."
+        )
+        stock_pct_min, stock_pct_max = stock_pct_range
+        stock_pct = (stock_pct_min + stock_pct_max) / 2.0
+    else:
+        stock_pct = st.sidebar.slider(
+            "Stock Percentage",
+            value=controls.get_float_state("stock_pct", 0.90),
+            min_value=0.0,
+            max_value=1.0,
+            step=0.05,
+            key="stock_pct",
+            help="Fraction of the portfolio allocated to US stocks; remainder to 10Y treasuries."
+        )
 
     cap_options = ["Unlimited"] + [f"{pct}%" for pct in range(100, 201, 5)]
     floor_options = ["Unlimited"] + [f"{pct}%" for pct in range(100, 24, -5)]
@@ -209,82 +210,79 @@ if st.runtime.exists():
 
     sanitized_cashflows = controls.sanitize_cashflows(st.session_state.get("cashflows"))
     sanitized_conditional_cashflows = controls.sanitize_conditional_cashflows(st.session_state.get("conditional_cashflows"))
-    st.session_state["target_success_rate"] = 0.80
+    if is_combo:
+        _render_sidebar_label("Target Success Rate Range")
+        target_success_rate_range = st.sidebar.slider(
+            "Target Success Rate Range",
+            value=st.session_state.get("target_success_rate_range", (0.70, 0.90)),
+            min_value=0.0,
+            max_value=1.0,
+            step=0.05,
+            key="target_success_rate_range",
+            help="Desired probability of success that will be used to select an initial spending rate.\n\nThe initial "
+                 "spending rate will be the rate at which fixed spending over all periods of time with length = the "
+                 "configured retirement period length, between the Historical Analysis Start Date and the Retirement Start "
+                 "Date, end with >0 values this percent of the time.\n\nSetting this higher, e.g. 0.80-0.99, is more conservative: "
+                 "lower initial spending, lower chance of adjustment; setting this lower is more aggressive, 0.75-0.60 provides higher "
+                 "initial spending, higher chance of adjustment.",
+            label_visibility="collapsed",
+        )
+        target_success_rate_min, target_success_rate_max = target_success_rate_range
+        target_success_rate = (target_success_rate_min + target_success_rate_max) / 2.0
+    else:
+        isr_params = {
+            'start_date': pd.to_datetime(start_date),
+            'duration_months': int(retirement_duration_months),
+            'analysis_start_date': pd.to_datetime(analysis_start_date),
+            'initial_value': float(initial_value),
+            'stock_pct': float(stock_pct),
+            'desired_success_rate': float(st.session_state.get("target_success_rate", 0.80)),
+            'final_value_target': float(st.session_state.get('final_value_target', 0.0)),
+            'final_value_target_ramp_down': bool(st.session_state.get('final_value_target_ramp_down', False)),
+            'cashflows': controls.cashflows_to_tuple(sanitized_cashflows),
+        }
+        isr_label_suffix = ""
 
-    # Compute Initial Spending Rate (ISR) to show in the Target Success Rate label.
-    # We recompute only when relevant inputs change to avoid unnecessary calls.
-    isr_params = {
-        'start_date': pd.to_datetime(start_date),
-        'duration_months': int(retirement_duration_months),
-        'analysis_start_date': pd.to_datetime(analysis_start_date),
-        'initial_value': float(initial_value),
-        'stock_pct': float(stock_pct),
-        'desired_success_rate': float(st.session_state.get('target_success_rate', 0.80)),
-        'final_value_target': float(st.session_state.get('final_value_target', 0.0)),
-        'final_value_target_ramp_down': bool(st.session_state.get('final_value_target_ramp_down', False)),
-        'cashflows': controls.cashflows_to_tuple(sanitized_cashflows),
-    }
-    isr_label_suffix = ""
+        try:
+            if 'isr_params' not in st.session_state or st.session_state['isr_params'] != isr_params:
+                display.update_isr_dynamic_label(isr_params=isr_params, cashflows=sanitized_cashflows)
+            isr = st.session_state.get('isr_value')
+            if isr is not None:
+                isr_label_suffix = f" (Initial SR: {isr*100:.2f}%)"
+                auto_initial_yearly_spending = round(float(initial_value) * float(isr))
+            else:
+                isr_label_suffix = " (Initial SR: N/A)"
+                auto_initial_yearly_spending = None
 
-    try:
-        if 'isr_params' not in st.session_state or st.session_state['isr_params'] != isr_params:
-            display.update_isr_dynamic_label(isr_params=isr_params, cashflows=sanitized_cashflows)
-        isr = st.session_state.get('isr_value')
-        if isr is not None:
-            isr_label_suffix = f" (Initial SR: {isr*100:.2f}%)"
-            auto_initial_yearly_spending = round(float(initial_value) * float(isr))
-        else:
+        except Exception as e:
+            print(e)
             isr_label_suffix = " (Initial SR: N/A)"
             auto_initial_yearly_spending = None
 
-    except Exception as e:
-        print(e)
-        isr_label_suffix = " (Initial SR: N/A)"
-        auto_initial_yearly_spending = None
-
-    target_success_label = f"Target Success Rate{isr_label_suffix}"
-    target_success_rate = st.sidebar.slider(
-        target_success_label,
-        min_value=0.0,
-        max_value=1.0,
-        step=0.01,
-        help="Desired probability of success that will be used to select an initial spending rate.\n\nThe initial "
-             "spending rate will be the rate at which fixed spending over all periods of time with length = the "
-             "configured retirement period length, between the Historical Analysis Start Date and the Retirement Start "
-             "Date, end with >0 values this percent of the time.\n\nSetting this higher, e.g. 0.80-0.99, is more conservative: "
-             "lower initial spending, lower chance of adjustment; setting this lower is more aggressive, 0.75-0.60 provides higher "
-             "initial spending, higher chance of adjustment.",
-        key="target_success_rate",
-        on_change=_unmark_initial_spending_overridden,
-    )
+        target_success_label = f"Target Success Rate{isr_label_suffix}"
+        target_success_rate = st.sidebar.slider(
+            target_success_label,
+            value=0.80,
+            min_value=0.0,
+            max_value=1.0,
+            step=0.05,
+            help="Desired probability of success that will be used to select an initial spending rate.\n\nThe initial "
+                 "spending rate will be the rate at which fixed spending over all periods of time with length = the "
+                 "configured retirement period length, between the Historical Analysis Start Date and the Retirement Start "
+                 "Date, end with >0 values this percent of the time.\n\nSetting this higher, e.g. 0.80-0.99, is more conservative: "
+                 "lower initial spending, lower chance of adjustment; setting this lower is more aggressive, 0.75-0.60 provides higher "
+                 "initial spending, higher chance of adjustment.",
+            key="target_success_rate",
+        )
 
     if "initial_yearly_spending" not in st.session_state:
         monthly_default = float(st.session_state.get("initial_monthly_spending", 0.0) or 0.0)
         st.session_state["initial_yearly_spending"] = monthly_default * display.MONTHS_PER_YEAR
 
-    # Current spending input is also an output when Target Success Rate moves, until it is manually overridden
-    #if auto_initial_yearly_spending is not None and not is_historical:
-    #    st.session_state["_initial_spending_auto_value"] = auto_initial_yearly_spending
-    #    current_value = st.session_state.get("initial_yearly_spending")
-    #    if st.session_state.get("_initial_spending_overridden") and current_value is not None and np.isclose(
-    #        float(current_value), float(auto_initial_yearly_spending), rtol=0.0, atol=6.0
-    #    ):
-    #        st.session_state["_initial_spending_overridden"] = False
-    #    if not st.session_state.get("_initial_spending_overridden"):
-    #        if current_value is None or not np.isclose(float(current_value), float(auto_initial_yearly_spending), rtol=0.0, atol=6.0):
-    #            st.session_state["initial_yearly_spending"] = float(auto_initial_yearly_spending)
-    #else:
-    st.session_state["_initial_spending_auto_value"] = None
-
-    if "initial_yearly_spending" not in st.session_state or st.session_state["initial_yearly_spending"] is None:
-        st.session_state["initial_yearly_spending"] = 0.0
-
     try:
         display.update_initial_spending_label(
             initial_spending=float(st.session_state.get("initial_yearly_spending", 0.0)),
             initial_value=float(initial_value),
-            auto_spending=st.session_state.get("_initial_spending_auto_value"),
-            overridden=bool(st.session_state.get("_initial_spending_overridden", False)),
         )
     except Exception as e:
         print(e)
@@ -304,7 +302,6 @@ if st.runtime.exists():
         help="The initial yearly spending level for the retirement simulation, which will be used until a guardrail is hit.\n\n"
              "Automatically updates as you change the Target Spending Rate, but can be set to a custom value if desired.\n\n",
         key="initial_yearly_spending",
-        on_change=_mark_initial_spending_overridden,
         label_visibility="collapsed",
     )
 
@@ -312,81 +309,111 @@ if st.runtime.exists():
     initial_monthly_spending = display.yearly_to_monthly(initial_yearly_spending)
     st.session_state["initial_monthly_spending"] = initial_monthly_spending
 
-    # Compute dynamic labels for Guardrail Success Rates showing initial (first period) PVs
-    upper_label_suffix = ""
-    lower_label_suffix = ""
-    try:
-        gr_params = {
-            'start_date': pd.to_datetime(start_date),
-            'duration_months': int(retirement_duration_months),
-            'analysis_start_date': pd.to_datetime(analysis_start_date),
-            'initial_value': float(initial_value),
-            'stock_pct': float(stock_pct),
-            'upper_sr': float(st.session_state.get("upper_guardrail_success", 1.00)),
-            'lower_sr': float(st.session_state.get("lower_guardrail_success", 0.75)),
-            'isr': float(st.session_state.get('isr_value')) if st.session_state.get('isr_value') is not None else None,
-            'initial_spending': float(initial_monthly_spending),
-            'final_value_target': float(st.session_state.get('final_value_target', 0.0)),
-            'final_value_target_ramp_down': bool(st.session_state.get('final_value_target_ramp_down', False)),
-            'cashflows': controls.cashflows_to_tuple(sanitized_cashflows),
-        }
+    if is_combo:
+        _render_sidebar_label("Upper Guardrail Success Rate Range")
+        upper_guardrail_range = st.sidebar.slider(
+            "Upper Guardrail Success Rate Range",
+            value=st.session_state.get("upper_guardrail_success_range", (0.80, 1.00)),
+            min_value=0.0,
+            max_value=1.0,
+            step=0.05,
+            key="upper_guardrail_success_range",
+            help="Range of success rates used to calculate the upper guardrail portfolio value.",
+            label_visibility="collapsed",
+        )
+        upper_guardrail_success_min, upper_guardrail_success_max = upper_guardrail_range
 
-        if ('guardrail_params' not in st.session_state) or (st.session_state['guardrail_params'] != gr_params):
-            display.update_guardrail_dynamic_labels(gr_params=gr_params, cashflows=sanitized_cashflows)
+        _render_sidebar_label("Lower Guardrail Success Rate Range")
+        lower_guardrail_range = st.sidebar.slider(
+            "Lower Guardrail Success Rate Range",
+            value=st.session_state.get("lower_guardrail_success_range", (0.25, 0.45)),
+            min_value=0.0,
+            max_value=1.0,
+            step=0.05,
+            key="lower_guardrail_success_range",
+            help="Range of success rates used to calculate the lower guardrail portfolio value.",
+            label_visibility="collapsed",
+        )
+        lower_guardrail_success_min, lower_guardrail_success_max = lower_guardrail_range
 
-        upper_label_suffix = st.session_state.get('upper_label_suffix', " (Initial PV: N/A)")
-        lower_label_suffix = st.session_state.get('lower_label_suffix', " (Initial PV: N/A)")
+        upper_guardrail_success = upper_guardrail_success_max
+        lower_guardrail_success = lower_guardrail_success_min
+    else:
+        # Compute dynamic labels for Guardrail Success Rates showing initial (first period) PVs
+        upper_label_suffix = ""
+        lower_label_suffix = ""
+        try:
+            gr_params = {
+                'start_date': pd.to_datetime(start_date),
+                'duration_months': int(retirement_duration_months),
+                'analysis_start_date': pd.to_datetime(analysis_start_date),
+                'initial_value': float(initial_value),
+                'stock_pct': float(stock_pct),
+                'upper_sr': float(st.session_state.get("upper_guardrail_success", 1.00)),
+                'lower_sr': float(st.session_state.get("lower_guardrail_success", 0.75)),
+                'isr': float(st.session_state.get('isr_value')) if st.session_state.get('isr_value') is not None else None,
+                'initial_spending': float(initial_monthly_spending),
+                'final_value_target': float(st.session_state.get('final_value_target', 0.0)),
+                'final_value_target_ramp_down': bool(st.session_state.get('final_value_target_ramp_down', False)),
+                'cashflows': controls.cashflows_to_tuple(sanitized_cashflows),
+            }
 
-    except Exception as e:
-        print(e)
-        upper_label_suffix = " (Initial PV: N/A)"
-        lower_label_suffix = " (Initial PV: N/A)"
-        st.session_state['upper_label_color'] = None
-        st.session_state['lower_label_color'] = None
+            if ('guardrail_params' not in st.session_state) or (st.session_state['guardrail_params'] != gr_params):
+                display.update_guardrail_dynamic_labels(gr_params=gr_params, cashflows=sanitized_cashflows)
 
-    upper_guardrail_label = f"Upper Guardrail Success Rate{upper_label_suffix}"
-    lower_guardrail_label = f"Lower Guardrail Success Rate{lower_label_suffix}"
+            upper_label_suffix = st.session_state.get('upper_label_suffix', " (Initial PV: N/A)")
+            lower_label_suffix = st.session_state.get('lower_label_suffix', " (Initial PV: N/A)")
 
-    upper_label_color = st.session_state.get('upper_label_color')
-    lower_label_color = st.session_state.get('lower_label_color')
+        except Exception as e:
+            print(e)
+            upper_label_suffix = " (Initial PV: N/A)"
+            lower_label_suffix = " (Initial PV: N/A)"
+            st.session_state['upper_label_color'] = None
+            st.session_state['lower_label_color'] = None
 
-    _render_sidebar_label(upper_guardrail_label, upper_label_color)
+        upper_guardrail_label = f"Upper Guardrail Success Rate{upper_label_suffix}"
+        lower_guardrail_label = f"Lower Guardrail Success Rate{lower_label_suffix}"
 
-    upper_guardrail_success = st.sidebar.slider(
-        upper_guardrail_label,
-        value=st.session_state.get("upper_guardrail_success", 1.00),
-        min_value=0.0,
-        max_value=1.0,
-        step=0.01,
-        help="The spending rate used to calculate the upper guardrail portfolio value.\n\nThis is the value where the "
-             "current spending amount, if held constant, will succeed this frequently or more, for all periods with "
-             "length = # months remaining in retirement, between the Historical Analysis Start Date and the current "
-             "simulation date.\n\nSetting this higher is more conservative, and will cause you to wait longer to increase "
-             "your spending when markets are up.",
-        key="upper_guardrail_success",
-        label_visibility="collapsed"
-    )
+        upper_label_color = st.session_state.get('upper_label_color')
+        lower_label_color = st.session_state.get('lower_label_color')
 
-    _render_sidebar_label(lower_guardrail_label, lower_label_color)
+        _render_sidebar_label(upper_guardrail_label, upper_label_color)
 
-    lower_guardrail_success = st.sidebar.slider(
-        lower_guardrail_label,
-        value=st.session_state.get("lower_guardrail_success", 0.25),
-        min_value=0.0,
-        max_value=1.0,
-        step=0.01,
-        help="The spending rate used to calculate the lower guardrail portfolio value.\n\nThis is the value where the "
-             "current spending amount, if held constant, will succeed this frequently or less, for all periods with "
-             "length = # months remaining in retirement, between the Historical Analysis Start Date and the current "
-             "simulation date.\n\nSetting this higher is more conservative, and will cause you to decrease your spending "
-             "sooner when markets are down.",
-        key="lower_guardrail_success",
-        label_visibility="collapsed"
-    )
+        upper_guardrail_success = st.sidebar.slider(
+            upper_guardrail_label,
+            value=st.session_state.get("upper_guardrail_success", 1.00),
+            min_value=0.0,
+            max_value=1.0,
+            step=0.05,
+            help="The spending rate used to calculate the upper guardrail portfolio value.\n\nThis is the value where the "
+                 "current spending amount, if held constant, will succeed this frequently or more, for all periods with "
+                 "length = # months remaining in retirement, between the Historical Analysis Start Date and the current "
+                 "simulation date.\n\nSetting this higher is more conservative, and will cause you to wait longer to increase "
+                 "your spending when markets are up.",
+            key="upper_guardrail_success",
+            label_visibility="collapsed"
+        )
+
+        _render_sidebar_label(lower_guardrail_label, lower_label_color)
+
+        lower_guardrail_success = st.sidebar.slider(
+            lower_guardrail_label,
+            value=st.session_state.get("lower_guardrail_success", 0.25),
+            min_value=0.0,
+            max_value=1.0,
+            step=0.05,
+            help="The spending rate used to calculate the lower guardrail portfolio value.\n\nThis is the value where the "
+                 "current spending amount, if held constant, will succeed this frequently or less, for all periods with "
+                 "length = # months remaining in retirement, between the Historical Analysis Start Date and the current "
+                 "simulation date.\n\nSetting this higher is more conservative, and will cause you to decrease your spending "
+                 "sooner when markets are down.",
+            key="lower_guardrail_success",
+            label_visibility="collapsed"
+        )
 
     upper_adjustment_fraction = st.sidebar.slider(
         "Upper Adjustment Fraction",
-        value=controls.get_float_state("upper_adjustment_fraction", 1.0),
+        value=controls.get_float_state("upper_adjustment_fraction", 0.5),
         min_value=0.0,
         max_value=1.0,
         step=0.05,
@@ -430,7 +457,7 @@ if st.runtime.exists():
     )
 
     frequency_options = ["Monthly", "Quarterly", "Biannually", "Annually"]
-    current_frequency = st.session_state.get("adjustment_frequency", "Monthly")
+    current_frequency = st.session_state.get("adjustment_frequency", "Quarterly")
     try:
         frequency_index = frequency_options.index(str(current_frequency))
     except ValueError:
@@ -515,7 +542,7 @@ if st.runtime.exists():
 
         controls.draw_conditional_cashflow_widget_rows()
 
-    if is_historical or is_simulation:
+    if is_historical or is_simulation or is_combo:
         
         st.sidebar.number_input(
             "Fixed Yearly Withdrawal (comparison)",
@@ -569,7 +596,7 @@ if st.runtime.exists():
         final_value_target_ramp_down=bool(st.session_state.get("final_value_target_ramp_down", False)),
         fixed_monthly_withdrawal=fixed_monthly_withdrawal,
         historical_future_extension_years=(
-            int(historical_future_extension_years) if is_historical else None
+            int(historical_future_extension_years) if (is_historical or is_combo) else None
         ),
         cashflows=cashflow_settings,
         conditional_cashflows=conditional_cashflow_settings,
@@ -578,7 +605,7 @@ if st.runtime.exists():
     st.session_state["settings"] = settings
 
     # Warn if guardrail success rates are in unexpected order
-    if not (lower_guardrail_success <= target_success_rate <= upper_guardrail_success):
+    if not is_combo and not (lower_guardrail_success <= target_success_rate <= upper_guardrail_success):
         st.sidebar.warning(
             "Guardrail success rates are in an unusual order. Typically: "
             "Lower Guardrail \u2264 Target \u2264 Upper Guardrail. "
@@ -595,7 +622,7 @@ if st.runtime.exists():
     st.session_state['dirty'] = dirty
 
     # When inputs change, visually dim and surround the main area with a red border
-    if dirty and not is_guidance:
+    if dirty and not is_guidance and not is_combo:
         controls.draw_dirty_border()
 
     # ------ Main Program Logic -------
@@ -688,9 +715,145 @@ if st.runtime.exists():
                 "Use this mode to run the guardrail withdrawal strategy across every historical retirement start year "
                 "for a fixed duration.\n\n"
                 "All dollar amounts shown are in real (constant) dollars, net of inflation. For more details, see the "
-                "[documentation](https://github.com/rogercost/fire-guardrails/blob/main/README.md)."
+                "[documentation](https://github.com/asurkhain/fire-guardrails/blob/main/README.md)."
             )
             st.info("Adjust parameters in the sidebar and click 'Run Historical Analysis' to start.")
+
+    elif is_combo:
+        if st.sidebar.button(
+            "Run Combo Analysis",
+            help="Run the guardrail withdrawal strategy across the configured parameter ranges.",
+        ):
+            status_ph = st.empty()
+            status_ph.text("Loading Shiller data...")
+            shiller_df = shiller_utils.get_cached_shiller_df(st.session_state)
+            status_ph.text("Shiller data loaded.")
+
+            progress = status_ph.progress(0, text="Running combo analysis... 0%")
+            state = {"pct": 0, "status": None}
+
+            def render_combo_progress():
+                label = f"Running combo analysis... {state['pct']}%"
+                if state["status"]:
+                    label = f"{label} — {state['status']}"
+                progress.progress(state["pct"], text=label)
+
+            def on_combo_progress(current, total):
+                pct = int(current * 100 / total) if total else 0
+                state["pct"] = pct
+                render_combo_progress()
+
+            def on_combo_status(msg):
+                state["status"] = msg
+                render_combo_progress()
+
+            try:
+                run_started_at = perf_counter()
+                stock_pct_range = st.session_state.get("stock_pct_range", (0.50, 0.90))
+                ugr_range = st.session_state.get("upper_guardrail_success_range", (0.80, 1.00))
+                lgr_range = st.session_state.get("lower_guardrail_success_range", (0.25, 0.45))
+                tsr_range = st.session_state.get("target_success_rate_range", (0.70, 0.90))
+                combo_results = utils.run_combo_analysis(
+                    df=shiller_df,
+                    settings=settings,
+                    stock_pct_range=stock_pct_range,
+                    upper_guardrail_success_range=ugr_range,
+                    lower_guardrail_success_range=lgr_range,
+                    target_success_rate_range=tsr_range,
+                    on_progress=on_combo_progress,
+                    on_status=on_combo_status,
+                )
+                combo_elapsed_seconds = perf_counter() - run_started_at
+                st.session_state["combo_results"] = combo_results
+                st.session_state["combo_elapsed_seconds"] = combo_elapsed_seconds
+                st.session_state["last_run_signature"] = sim_signature
+                st.session_state["dirty"] = False
+                status_ph.empty()
+                display.render_combo_results(
+                    combo_results,
+                    calculation_time_seconds=combo_elapsed_seconds,
+                    fixed_monthly_withdrawal=fixed_monthly_withdrawal,
+                )
+                # Auto-save with settings-encoded filename
+                _sp = stock_pct_range
+                _ugr = ugr_range
+                _lgr = lgr_range
+                _tsr = tsr_range
+                _uaf = settings.upper_adjustment_fraction
+                _laf = settings.lower_adjustment_fraction
+                _fname = (
+                    f"combo_sp={_sp[0]:.0%}-{_sp[1]:.0%}"
+                    f"_ugr={_ugr[0]:.0%}-{_ugr[1]:.0%}"
+                    f"_lgr={_lgr[0]:.0%}-{_lgr[1]:.0%}"
+                    f"_tsr={_tsr[0]:.0%}-{_tsr[1]:.0%}"
+                    f"_uaf={_uaf:.0%}_laf={_laf:.0%}.joblib"
+                )
+                try:
+                    utils.save_combo_results(combo_results, str(Path(utils.get_combo_tempdir()) / _fname))
+                except Exception as e2:
+                    pass
+                _combo_dir = Path(utils.get_combo_tempdir())
+                _combo_files = sorted([f.name for f in _combo_dir.iterdir() if f.suffix == ".joblib"])
+                if _combo_files:
+                    _selected = st.selectbox("Switch to saved combo results", _combo_files, key="combo_switch_select", index=0)
+                    if st.button("Load", key="combo_switch_btn"):
+                        try:
+                            loaded = utils.load_combo_results(str(_combo_dir / _selected))
+                            st.session_state["combo_results"] = loaded
+                            st.session_state["combo_elapsed_seconds"] = None
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Failed to load combo results: {e}")
+            except Exception as e:
+                status_ph.empty()
+                traceback.print_exc()
+                st.error(f"Unable to run combo analysis: {e}")
+
+        elif "combo_results" in st.session_state:
+            if st.session_state.get("dirty"):
+                controls.render_dirty_banner()
+            display.render_combo_results(
+                st.session_state["combo_results"],
+                calculation_time_seconds=st.session_state.get("combo_elapsed_seconds"),
+                fixed_monthly_withdrawal=fixed_monthly_withdrawal,
+            )
+            _combo_dir = Path(utils.get_combo_tempdir())
+            _combo_files = sorted([f.name for f in _combo_dir.iterdir() if f.suffix == ".joblib"])
+            if _combo_files:
+                _selected = st.selectbox("Switch to saved combo results", _combo_files, key="combo_switch_select", index=0)
+                if st.button("Load", key="combo_switch_btn"):
+                    try:
+                        loaded = utils.load_combo_results(str(_combo_dir / _selected))
+                        st.session_state["combo_results"] = loaded
+                        st.session_state["combo_elapsed_seconds"] = None
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Failed to load combo results: {e}")
+        else:
+            st.subheader("Combo Mode")
+            st.markdown(
+                "Use this mode to run the guardrail withdrawal strategy across a grid of parameters, "
+                "varying stock allocation and guardrail success rates within the configured ranges."
+                "Note, the three Success Rate Ranges are dependent e.g. the min of all of them is 1 run, then"
+                " the next run is 5% added to all three, etc.\n\n"
+                "All dollar amounts shown are in real (constant) dollars, net of inflation. For more details, see the "
+                "[documentation](https://github.com/asurkhain/fire-guardrails/blob/main/README.md)."
+            )
+            _combo_dir = Path(utils.get_combo_tempdir())
+            _combo_files = sorted([f.name for f in _combo_dir.iterdir() if f.suffix == ".joblib"])
+            if _combo_files:
+                _selected = st.selectbox("Load previous combo results", _combo_files, key="combo_load_select")
+                if st.button("Load from File", key="combo_load_btn"):
+                    try:
+                        loaded = utils.load_combo_results(str(_combo_dir / _selected))
+                        st.session_state["combo_results"] = loaded
+                        st.session_state["combo_elapsed_seconds"] = None
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Failed to load combo results: {e}")
+            else:
+                st.caption("No saved combo results found.")
+            st.info("Adjust parameters in the sidebar and click 'Run Combo Analysis' to start.")
 
     elif is_simulation and st.sidebar.button(
         "Run Simulation",
@@ -751,7 +914,7 @@ if st.runtime.exists():
             st.markdown(
                 "Use this mode to simulate running a guardrail-based retirement withdrawal strategy during a historical period.\n\n"
                 "All dollar amounts shown are in real (constant) dollars, net of inflation. For more details, see the "
-                "[documentation](https://github.com/rogercost/fire-guardrails/blob/main/README.md)."
+                "[documentation](https://github.com/asurkhain/fire-guardrails/blob/main/README.md"
             )
             st.info("Adjust parameters in the sidebar and click 'Run Simulation' to start.")
 

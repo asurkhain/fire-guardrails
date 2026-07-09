@@ -1,5 +1,6 @@
 ## Changes
 - Historical Mode: runs for multiple periods starting from a configurable date and reports the results.
+- Combo Mode: runs historical mode with the combination of ranges of inputs
 - Added CAPE withdrawal strategy and VPW withdrawal strategy for comparison.
 - Misc small changes
 

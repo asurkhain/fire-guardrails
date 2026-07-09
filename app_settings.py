@@ -215,7 +215,7 @@ class Settings:
             raise ValueError(
                 f"Lower guardrail success rate must be between 0% and 100%, got {self.lower_guardrail_success * 100:.0f}%"
             )
-        if self.mode != "Historical Mode" and self.analysis_start_date > self.start_date:
+        if self.mode not in ("Historical Mode", "Combo Mode") and self.analysis_start_date > self.start_date:
             raise ValueError(
                 f"Historical analysis start date ({self.analysis_start_date}) cannot be after "
                 f"retirement start date ({self.start_date})"
@@ -407,10 +407,10 @@ class Settings:
             initial_spending_overridden=data.get("initial_spending_overridden", False),
             upper_guardrail_success=data.get("upper_guardrail_success", 1.0),
             lower_guardrail_success=data.get("lower_guardrail_success", 0.75),
-            upper_adjustment_fraction=data.get("upper_adjustment_fraction", 1.0),
+            upper_adjustment_fraction=data.get("upper_adjustment_fraction", 0.5),
             lower_adjustment_fraction=data.get("lower_adjustment_fraction", 0.1),
             adjustment_threshold=data.get("adjustment_threshold", 0.05),
-            adjustment_frequency=data.get("adjustment_frequency", "Monthly"),
+            adjustment_frequency=data.get("adjustment_frequency", "Quarterly"),
             spending_cap_option=data.get("spending_cap_option", "Unlimited"),
             spending_floor_option=data.get("spending_floor_option", "Unlimited"),
             shiller_extension_mode=data.get("shiller_extension_mode", "hard_code_date"),
@@ -461,10 +461,12 @@ class Settings:
         session_state["analysis_start_date"] = self.analysis_start_date
         session_state["initial_portfolio_value"] = self.initial_value
         session_state["stock_pct"] = self.stock_pct
-        session_state["target_success_rate"] = self.target_success_rate
+        if self.mode == "Combo Mode":
+            sr = self.target_success_rate
+            half_range = 0.10
+            session_state["target_success_rate_range"] = (max(0.0, sr - half_range), min(1.0, sr + half_range))
         session_state["initial_monthly_spending"] = self.initial_monthly_spending
         session_state["initial_yearly_spending"] = float(self.initial_monthly_spending) * 12
-        session_state["_initial_spending_overridden"] = bool(self.initial_spending_overridden)
         session_state["upper_guardrail_success"] = self.upper_guardrail_success
         session_state["lower_guardrail_success"] = self.lower_guardrail_success
         session_state["upper_adjustment_fraction"] = self.upper_adjustment_fraction
