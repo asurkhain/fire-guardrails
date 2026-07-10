@@ -13,7 +13,7 @@ from app_settings import Settings
 from cape_utils import calculate_cape_withdrawal_rate, simulate_cape_withdrawal_retirement
 from vpw_utils import _apply_vpw_comparison_step, simulate_vpw_withdrawal_retirement
 from shiller_utils import *  # noqa: F401,F403
-from helpers import is_successful_ending_value, is_successful_ending_value_with_clamp
+
 
 
 @dataclass
@@ -745,6 +745,7 @@ def get_guardrail_withdrawals(
         return spending_rate
 
     for i in range(total_months):
+        last_month = i >= (total_months - 1)
         current_date = current_dates[i]
         current_month = int(months[i])
         months_remaining = len(subset) - i
@@ -868,12 +869,13 @@ def get_guardrail_withdrawals(
 
         # Combine regular and conditional cashflows
         total_cashflow = current_cashflow + conditional_cashflow
+        # recalculate spending target to be at least the total cashflow
+        spending_target = max(spending_target, total_cashflow)
 
-        withdrawal_amount = spending_target - total_cashflow
-        # Note: withdrawal_amount can be negative when cashflow exceeds spending,
-        # which effectively deposits the excess into the portfolio
-        # Fixed path withdrawal for this month (does not include conditional cashflows)
-        fixed_actual_withdrawal = 0.0 if fixed_depleted else max(fixed_total_spending - current_cashflow, 0.0)
+        # Withdrawal for this month
+        withdrawal_amount = 0.0 if guardrail_depleted else max(spending_target - total_cashflow, 0.0)
+        # Fixed path withdrawal for this month
+        fixed_actual_withdrawal = 0.0 if fixed_depleted else max(fixed_total_spending - total_cashflow, 0.0)
 
         # CAPE path
         if not cape_depleted:
@@ -890,7 +892,7 @@ def get_guardrail_withdrawals(
                     cape_monthly_spending + current_cashflow,
                     float(settings.initial_monthly_spending),
                 )
-            cape_actual_withdrawal = max(cape_monthly_spending - current_cashflow, 0.0)
+            cape_actual_withdrawal = max(cape_monthly_spending - total_cashflow, 0.0)
         else:
             cape_monthly_spending = 0.0
             cape_actual_withdrawal = 0.0
@@ -901,20 +903,37 @@ def get_guardrail_withdrawals(
                 portfolio_value=vpw_portfolio_value,
                 months_remaining=months_remaining,
                 stock_pct=settings.stock_pct,
-                current_cashflow=current_cashflow,
+                current_cashflow=total_cashflow,
                 cap_amount=cap_amount,
                 floor_amount=floor_amount,
             )
         else:
             vpw_monthly_spending = 0.0
             vpw_actual_withdrawal = 0.0
-            vpw_payment_rate = 0.0
 
         # Update portfolio values - Apply withdrawals taken this month
         current_portfolio_value -= withdrawal_amount
         fixed_portfolio_value -= fixed_actual_withdrawal
         cape_portfolio_value -= cape_actual_withdrawal
         vpw_portfolio_value -= vpw_actual_withdrawal
+
+        # Floor at zero and mark depletion so future months remain at zero
+        if current_portfolio_value <= 0:
+            current_portfolio_value = 0.0
+            guardrail_depleted = True
+        if fixed_portfolio_value <= 0:
+            fixed_portfolio_value = 0.0
+            fixed_depleted = True
+        if cape_portfolio_value <= 0:
+            cape_portfolio_value = 0.0
+            # CAPE can drive the portfolio slightly below 0 in the last month, so ignore that
+            if not last_month:
+                cape_depleted = True
+        if vpw_portfolio_value <= 0:
+            vpw_portfolio_value = 0.0
+            # VPW can drive the portfolio slightly below 0 in the last month, so ignore that
+            if not last_month:
+                vpw_depleted = True
 
         # Store results
         results.append({
@@ -933,10 +952,10 @@ def get_guardrail_withdrawals(
             'VPW_Value': vpw_portfolio_value,
             'VPW_Withdrawal': vpw_actual_withdrawal,
             'VPW_Total_Spending': vpw_monthly_spending,
-            'Guardrail_Success': is_successful_ending_value(current_portfolio_value),
-            'Fixed_Success': is_successful_ending_value(fixed_portfolio_value),
-            'CAPE_Success': is_successful_ending_value(cape_portfolio_value),
-            'VPW_Success': is_successful_ending_value(vpw_portfolio_value),
+            'Guardrail_Success': not guardrail_depleted,
+            'Fixed_Success': not fixed_depleted,
+            'CAPE_Success': not cape_depleted,
+            'VPW_Success': not vpw_depleted,
             'Upper_Guardrail': upper_guardrail_value,
             'Lower_Guardrail': lower_guardrail_value,
             'Guardrail_Hit': guardrail_hit,
@@ -955,19 +974,7 @@ def get_guardrail_withdrawals(
             cape_portfolio_value *= month_return
             vpw_portfolio_value *= month_return
 
-        # Floor at zero and mark depletion so future months remain at zero
-        if current_portfolio_value <= 0:
-            current_portfolio_value = 0.0
-            guardrail_depleted = True
-        if fixed_portfolio_value <= 0:
-            fixed_portfolio_value = 0.0
-            fixed_depleted = True
-        if cape_portfolio_value <= 0:
-            cape_portfolio_value = 0.0
-            cape_depleted = True
-        if vpw_portfolio_value <= 0:
-            vpw_portfolio_value = 0.0
-            vpw_depleted = True
+
 
         # Update state
         previous_total_spending = spending_target
@@ -1027,17 +1034,6 @@ def _spending_stats_from_results(results_df: pd.DataFrame) -> dict:
         "avg_spending": float(spending.mean()),
     }
 
-
-
-
-
-def _guardrail_run_success(results_df: pd.DataFrame, final_value_target: float) -> tuple:
-    """Return (success, ending_portfolio_value) for a guardrail simulation."""
-    if results_df is None or results_df.empty:
-        return False, 0.0
-    success, ending_value = is_successful_ending_value_with_clamp(float(results_df["Portfolio_Value"].iloc[-1]))
-    return success, ending_value
-
 def simulate_fixed_withdrawal_retirement(
     df: pd.DataFrame,
     settings: Settings,
@@ -1094,9 +1090,9 @@ def simulate_fixed_withdrawal_retirement(
             portfolio_value = 0.0
             depleted = True
 
-    ending_value = float(portfolio_value)
+    ending_value = max(portfolio_value, 0.0)
     success = ending_value > 0
-    return {"success": success, "ending_value": ending_value}
+    return {"success": not depleted, "ending_value": ending_value}
 
 
 def _run_single_retirement_task(start, context_spec: HistoricalWorkerContext | None = None) -> dict:
@@ -1128,7 +1124,9 @@ def _run_single_retirement_task(start, context_spec: HistoricalWorkerContext | N
         all_cape_values=context.all_cape_values,
     )
     spending_stats = _spending_stats_from_results(results_df)
-    success, ending_value = _guardrail_run_success(results_df, settings.final_value_target)
+
+    ending_value = max(results_df["Portfolio_Value"].iloc[-1], 0.0)
+    success = results_df["Guardrail_Success"].iloc[-1]
     end_date = period_settings.retirement_end_date()
 
     initial_monthly = float(period_settings.initial_monthly_spending)
@@ -1138,13 +1136,14 @@ def _run_single_retirement_task(start, context_spec: HistoricalWorkerContext | N
         else 0.0
     )
     withdraw_compare = fixed_monthly if fixed_monthly > 0.0 else initial_monthly
-    pct_below_initial = float((results_df["Withdrawal"] < withdraw_compare).mean()) if not results_df.empty else np.nan
+    pct_below_initial = float((results_df["Total_Spending"] < withdraw_compare).mean()) if not results_df.empty else np.nan
 
     row = {
         "Start_Year": start.year,
         "Start_Date": start,
         "End_Date": end_date,
         "Guardrail_Success": success,
+        "Starting_Portfolio": float(settings.initial_value),
         "Ending_Portfolio": ending_value,
         "pct_below_initial": pct_below_initial,
         **spending_stats,

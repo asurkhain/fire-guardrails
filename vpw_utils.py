@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-from helpers import is_successful_ending_value_with_clamp
 
 from app_settings import Settings
 
@@ -143,42 +142,52 @@ def simulate_vpw_withdrawal_retirement(
     )
     depleted = False
     yearly_withdrawals = []
+    monthly_baseline = float(settings.fixed_monthly_withdrawal) if settings.fixed_monthly_withdrawal is not None else float(settings.initial_monthly_spending)
+    months_below_baseline = 0
+    total_months_processed = 0
 
     full_indices = subset["_Full_Index"].to_numpy(dtype=np.int64, copy=False)
 
     for i in range(total_months):
+        last_month = i >= (total_months - 1)
         if i % 12 == 0:
             yearly_withdrawals.append(0.0)
-        if depleted:
-            break
-        current_cashflow = float(monthly_cashflows[i]) if i < len(monthly_cashflows) else 0.0
-        months_remaining = total_months - i
-        monthly_spending, _, _ = _apply_vpw_comparison_step(
-            portfolio_value=portfolio_value,
-            months_remaining=months_remaining,
-            stock_pct=settings.stock_pct,
-            current_cashflow=current_cashflow,
-            cap_amount=cap_amount,
-            floor_amount=floor_amount,
-        )
-        withdrawal = max(monthly_spending - current_cashflow, 0.0)
-        portfolio_value -= withdrawal
-        yearly_withdrawals[-1] += monthly_spending
-        if i < len(subset) - 1:
-            full_idx = int(full_indices[i])
-            month_return = portfolio_returns[full_idx + 1] if full_idx + 1 < len(portfolio_returns) else 1.0
-            portfolio_value *= month_return
-        if portfolio_value <= 0.0:
-            depleted = True
+        total_months_processed += 1
+        if not depleted:
+            current_cashflow = float(monthly_cashflows[i]) if i < len(monthly_cashflows) else 0.0
+            months_remaining = total_months - i
+            monthly_spending, _, _ = _apply_vpw_comparison_step(
+                portfolio_value=portfolio_value,
+                months_remaining=months_remaining,
+                stock_pct=settings.stock_pct,
+                current_cashflow=current_cashflow,
+                cap_amount=cap_amount,
+                floor_amount=floor_amount,
+            )
+            if monthly_spending < monthly_baseline:
+                months_below_baseline += 1
+            withdrawal = max(monthly_spending - current_cashflow, 0.0)
+            portfolio_value -= withdrawal
+            yearly_withdrawals[-1] += monthly_spending
+            if not last_month:
+                full_idx = int(full_indices[i])
+                month_return = portfolio_returns[full_idx + 1] if full_idx + 1 < len(portfolio_returns) else 1.0
+                portfolio_value *= month_return
+            # calculate depletion up to last month
+            if not last_month and portfolio_value <= 0.0:
+                depleted = True
+        else:
+            # Match simulation mode: post-depletion months count as 0 spending (below baseline)
+            months_below_baseline += 1
+            yearly_withdrawals[-1] += 0.0
 
-    success, ending_value = is_successful_ending_value_with_clamp(portfolio_value)
-    fixed_yearly = baseline_monthly_withdrawal * 12
+    ending_value = max(portfolio_value, 0.0)
     return {
-        "success": success,
+        "success": not depleted,
         "ending_value": ending_value,
         "min_withdrawal": min(yearly_withdrawals),
         "max_withdrawal": max(yearly_withdrawals),
         "avg_withdrawal": sum(yearly_withdrawals) / len(yearly_withdrawals),
         "median_withdrawal": np.median(yearly_withdrawals),
-        "pct_below_fixed": (len([x for x in yearly_withdrawals if x < fixed_yearly]) / len(yearly_withdrawals)),
+        "pct_below_fixed": months_below_baseline / total_months_processed if total_months_processed > 0 else 0.0,
     }

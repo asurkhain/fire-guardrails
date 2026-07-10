@@ -262,7 +262,7 @@ if st.runtime.exists():
         target_success_label = f"Target Success Rate{isr_label_suffix}"
         target_success_rate = st.sidebar.slider(
             target_success_label,
-            value=0.80,
+            value=st.session_state.get("target_success_rate", 0.80),
             min_value=0.0,
             max_value=1.0,
             step=0.05,

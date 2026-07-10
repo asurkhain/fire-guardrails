@@ -10,7 +10,8 @@ import requests
 # last_year, average_return, or hard_code_date
 SHILLER_EXTENSION_MODE = "hard_code_date"
 SHILLER_AVERAGE_RETURN_LOOKBACK_YEARS = 10
-SHILLER_HARD_CODE_DATE = pd.Timestamp("2007-08-01")
+SHILLER_HARD_CODE_DATE = pd.Timestamp("1965-01-01")
+#SHILLER_HARD_CODE_DATE = pd.Timestamp("2007-08-01")
 
 
 def parse_shiller_date(series):

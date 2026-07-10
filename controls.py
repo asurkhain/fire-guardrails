@@ -225,7 +225,7 @@ def initialize_display():
     if "conditional_cashflows" not in st.session_state:
         st.session_state["conditional_cashflows"] = []
     if "final_value_target" not in st.session_state:
-        st.session_state["final_value_target"] = 100_000.0
+        st.session_state["final_value_target"] = 0.0
     if "retirement_duration_years" not in st.session_state:
         st.session_state["retirement_duration_years"] = 50
     if "fixed_monthly_withdrawal" not in st.session_state:
