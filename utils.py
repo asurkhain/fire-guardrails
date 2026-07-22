@@ -1394,7 +1394,7 @@ def run_historical_retirements_analysis(
 
 def get_combo_tempdir() -> str:
     """Return the temp directory used for combo result files, creating it if needed."""
-    d = Path(tempfile.gettempdir()) / "fire-guardrails-combo"
+    d = Path.cwd() / "temp"
     d.mkdir(parents=True, exist_ok=True)
     return str(d)
 

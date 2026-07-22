@@ -466,7 +466,10 @@ class Settings:
             half_range = 0.10
             session_state["target_success_rate_range"] = (max(0.0, sr - half_range), min(1.0, sr + half_range))
         session_state["initial_monthly_spending"] = self.initial_monthly_spending
-        session_state["initial_yearly_spending"] = float(self.initial_monthly_spending) * 12
+        if self.initial_value > 0:
+            session_state["initial_yearly_spending"] = float(self.initial_monthly_spending) * 12 / self.initial_value * 100.0
+        else:
+            session_state["initial_yearly_spending"] = 0.0
         session_state["upper_guardrail_success"] = self.upper_guardrail_success
         session_state["lower_guardrail_success"] = self.lower_guardrail_success
         session_state["upper_adjustment_fraction"] = self.upper_adjustment_fraction
@@ -479,8 +482,8 @@ class Settings:
         session_state["final_value_target"] = self.final_value_target
         session_state["final_value_target_ramp_down"] = bool(self.final_value_target_ramp_down)
         session_state["fixed_monthly_withdrawal"] = self.fixed_monthly_withdrawal
-        if self.fixed_monthly_withdrawal is not None:
-            session_state["fixed_yearly_withdrawal_input"] = float(self.fixed_monthly_withdrawal) * 12
+        if self.fixed_monthly_withdrawal is not None and self.initial_value > 0:
+            session_state["fixed_yearly_withdrawal_input"] = float(self.fixed_monthly_withdrawal) * 12 / self.initial_value * 100.0
         else:
             session_state["fixed_yearly_withdrawal_input"] = 0.0
         session_state["cashflows"] = [flow.to_serializable() for flow in self.cashflows]

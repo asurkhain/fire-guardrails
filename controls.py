@@ -6,7 +6,7 @@ import streamlit as st
 from app_settings import Settings
 
 MONTHS_PER_YEAR = 12
-DEFAULT_FIXED_WITHDRAWAL_RATE = 0.035
+DEFAULT_FIXED_WITHDRAWAL_RATE = 0.0375
 DEFAULT_INITIAL_SPENDING_RATE = 0.04
 
 DIRTY_COLOR = "#8B0000"  # dark red
@@ -246,16 +246,10 @@ def initialize_display():
     if "initial_portfolio_value" not in st.session_state:
         st.session_state["initial_portfolio_value"] = 1_000_000.0
     if "fixed_yearly_withdrawal_input" not in st.session_state:
-        _default_fixed_yearly_input = (
-            float(st.session_state.get("initial_portfolio_value", 1_000_000.0) or 0.0)
-            * DEFAULT_FIXED_WITHDRAWAL_RATE
-        )
+        _default_fixed_yearly_input = DEFAULT_FIXED_WITHDRAWAL_RATE * 100.0
         st.session_state["fixed_yearly_withdrawal_input"] = _default_fixed_yearly_input
     if "initial_yearly_spending" not in st.session_state:
-        _default_initial_yearly_spending = (
-            float(st.session_state.get("initial_portfolio_value", 1_000_000.0) or 0.0)
-            * DEFAULT_INITIAL_SPENDING_RATE
-        )
+        _default_initial_yearly_spending = DEFAULT_INITIAL_SPENDING_RATE * 100.0
         st.session_state["initial_yearly_spending"] = _default_initial_yearly_spending
     
 

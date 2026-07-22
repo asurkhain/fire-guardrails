@@ -148,23 +148,6 @@ def update_guardrail_dynamic_labels(gr_params: dict, cashflows: list):
     st.session_state['guardrail_params'] = gr_params
 
 
-def update_initial_spending_label(initial_spending: float,
-                                  initial_value: float) -> None:
-    """Compute the dynamic label text and color for the Initial Yearly Spending control."""
-
-    spending_rate = None
-    if initial_value and initial_value > 0:
-        spending_rate = float(initial_spending) / float(initial_value)
-
-    if spending_rate is not None and np.isfinite(spending_rate):
-        label_text = f"Initial Yearly Spending ({spending_rate * 100:.2f}% SR)"
-    else:
-        label_text = "Initial Yearly Spending (SR: N/A)"
-
-    st.session_state['initial_spending_label_text'] = label_text
-    #st.session_state['initial_spending_label_color'] = label_color
-
-
 def render_simulation_results(
     results_df: pd.DataFrame,
     fixed_monthly_withdrawal: Optional[float] = None,
