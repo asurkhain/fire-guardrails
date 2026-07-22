@@ -249,7 +249,7 @@ if st.runtime.exists():
             isr = st.session_state.get('isr_value')
             if isr is not None:
                 isr_label_suffix = f" (Initial SR: {isr*100:.2f}%)"
-                auto_initial_yearly_spending = round(float(initial_value) * float(isr))
+                auto_initial_yearly_spending = round(float(isr) * 100, 2)
             else:
                 isr_label_suffix = " (Initial SR: N/A)"
                 auto_initial_yearly_spending = None
@@ -275,38 +275,22 @@ if st.runtime.exists():
             key="target_success_rate",
         )
 
-    if "initial_yearly_spending" not in st.session_state:
-        monthly_default = float(st.session_state.get("initial_monthly_spending", 0.0) or 0.0)
-        st.session_state["initial_yearly_spending"] = monthly_default * display.MONTHS_PER_YEAR
-
-    try:
-        display.update_initial_spending_label(
-            initial_spending=float(st.session_state.get("initial_yearly_spending", 0.0)),
-            initial_value=float(initial_value),
-        )
-    except Exception as e:
-        print(e)
-        st.session_state['initial_spending_label_text'] = "Initial Yearly Spending (WR: N/A)"
-        st.session_state['initial_spending_label_color'] = None
-
-    initial_spending_label = st.session_state.get('initial_spending_label_text', "Initial Yearly Spending (WR: N/A)")
-    initial_spending_color = st.session_state.get('initial_spending_label_color')
-
-    _render_sidebar_label(initial_spending_label, initial_spending_color)
+    _render_sidebar_label("Initial Yearly Spending %")
 
     st.sidebar.number_input(
-        initial_spending_label,
+        "Initial Yearly Spending %",
         min_value=0.0,
-        step=120.0,
-        format="%.0f",
-        help="The initial yearly spending level for the retirement simulation, which will be used until a guardrail is hit.\n\n"
+        step=0.25,
+        format="%.2f",
+        help="The initial yearly spending as a percentage of the initial portfolio value.\n\n"
+             "e.g., 4.25 means 4.25% of the initial portfolio per year.\n\n"
              "Automatically updates as you change the Target Spending Rate, but can be set to a custom value if desired.\n\n",
         key="initial_yearly_spending",
         label_visibility="collapsed",
     )
 
-    initial_yearly_spending = float(st.session_state.get("initial_yearly_spending", 0.0))
-    initial_monthly_spending = display.yearly_to_monthly(initial_yearly_spending)
+    initial_yearly_spending_pct = float(st.session_state.get("initial_yearly_spending", 0.0))
+    initial_monthly_spending = initial_value * initial_yearly_spending_pct / 100.0 / 12.0
     st.session_state["initial_monthly_spending"] = initial_monthly_spending
 
     if is_combo:
@@ -543,19 +527,22 @@ if st.runtime.exists():
         controls.draw_conditional_cashflow_widget_rows()
 
     if is_historical or is_simulation or is_combo:
-        
+        _render_sidebar_label("Fixed Yearly Withdrawal %")
+
         st.sidebar.number_input(
-            "Fixed Yearly Withdrawal (comparison)",
+            "Fixed Yearly Withdrawal %",
             min_value=0.0,
-            step=120.0,
-            format="%.0f",
+            step=0.25,
+            format="%.2f",
             key="fixed_yearly_withdrawal_input",
-            help="Optional fixed yearly withdrawal amount used only for comparison. "
+            help="Optional fixed yearly withdrawal as a percentage of the initial portfolio value, used only for comparison.\n\n"
+                 "e.g., 3.75 means 3.75% of the initial portfolio per year.\n\n"
                  "Leave at 0 to skip fixed-withdrawal comparison.",
+            label_visibility="collapsed",
         )
-        _fixed_yearly_input = float(st.session_state.get("fixed_yearly_withdrawal_input", 0.0) or 0.0)
+        _fixed_yearly_pct = float(st.session_state.get("fixed_yearly_withdrawal_input", 0.0) or 0.0)
         fixed_monthly_withdrawal = (
-            display.yearly_to_monthly(_fixed_yearly_input) if _fixed_yearly_input > 0 else None
+            initial_value * _fixed_yearly_pct / 100.0 / 12.0 if _fixed_yearly_pct > 0 else None
         )
         st.session_state["fixed_monthly_withdrawal"] = fixed_monthly_withdrawal
     else:

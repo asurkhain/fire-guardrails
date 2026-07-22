@@ -6,3 +6,5 @@ tempdir/
 *.iml
 .pytest_cache/
 .git
+temp/*
+temp - Copy
