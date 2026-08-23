@@ -142,6 +142,8 @@ def simulate_vpw_withdrawal_retirement(
     )
     depleted = False
     yearly_withdrawals = []
+    yearly_actual_withdrawals = []
+    depletion_year_index = None
     monthly_baseline = float(settings.fixed_monthly_withdrawal) if settings.fixed_monthly_withdrawal is not None else float(settings.initial_monthly_spending)
     months_below_baseline = 0
     total_months_processed = 0
@@ -152,6 +154,7 @@ def simulate_vpw_withdrawal_retirement(
         last_month = i >= (total_months - 1)
         if i % 12 == 0:
             yearly_withdrawals.append(0.0)
+            yearly_actual_withdrawals.append(0.0)
         total_months_processed += 1
         if not depleted:
             current_cashflow = float(monthly_cashflows[i]) if i < len(monthly_cashflows) else 0.0
@@ -169,6 +172,7 @@ def simulate_vpw_withdrawal_retirement(
             withdrawal = max(monthly_spending - current_cashflow, 0.0)
             portfolio_value -= withdrawal
             yearly_withdrawals[-1] += monthly_spending
+            yearly_actual_withdrawals[-1] += withdrawal
             if not last_month:
                 full_idx = int(full_indices[i])
                 month_return = portfolio_returns[full_idx + 1] if full_idx + 1 < len(portfolio_returns) else 1.0
@@ -176,18 +180,36 @@ def simulate_vpw_withdrawal_retirement(
             # calculate depletion up to last month
             if not last_month and portfolio_value <= 0.0:
                 depleted = True
+                depletion_year_index = len(yearly_withdrawals) - 1
         else:
             # Match simulation mode: post-depletion months count as 0 spending (below baseline)
             months_below_baseline += 1
             yearly_withdrawals[-1] += 0.0
+            yearly_actual_withdrawals[-1] += 0.0
 
     ending_value = max(portfolio_value, 0.0)
+    stats_withdrawals = (
+        yearly_withdrawals[:depletion_year_index + 1]
+        if depletion_year_index is not None
+        else yearly_withdrawals
+    ) or yearly_withdrawals
+
+    stats_actual_withdrawals = (
+        yearly_actual_withdrawals[:depletion_year_index + 1]
+        if depletion_year_index is not None
+        else yearly_actual_withdrawals
+    ) or yearly_actual_withdrawals
+
     return {
         "success": not depleted,
         "ending_value": ending_value,
-        "min_withdrawal": min(yearly_withdrawals),
-        "max_withdrawal": max(yearly_withdrawals),
-        "avg_withdrawal": sum(yearly_withdrawals) / len(yearly_withdrawals),
-        "median_withdrawal": np.median(yearly_withdrawals),
+        "min_withdrawal": min(stats_withdrawals),
+        "max_withdrawal": max(stats_withdrawals),
+        "avg_withdrawal": sum(stats_withdrawals) / len(stats_withdrawals),
+        "median_withdrawal": np.median(stats_withdrawals),
+        "min_actual_withdrawal": min(stats_actual_withdrawals),
+        "max_actual_withdrawal": max(stats_actual_withdrawals),
+        "avg_actual_withdrawal": sum(stats_actual_withdrawals) / len(stats_actual_withdrawals),
+        "median_actual_withdrawal": np.median(stats_actual_withdrawals),
         "pct_below_fixed": months_below_baseline / total_months_processed if total_months_processed > 0 else 0.0,
     }

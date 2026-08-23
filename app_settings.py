@@ -147,6 +147,9 @@ class Settings:
     historical_future_extension_years: Optional[int] = None
     cashflows: List[CashflowSetting] = field(default_factory=list)
     conditional_cashflows: List[ConditionalCashflowSetting] = field(default_factory=list)
+    accounts: List[Dict[str, Any]] = field(default_factory=list)
+    marital_status: str = "single"
+    current_age: Optional[float] = None
 
     SHILLER_EXTENSION_MODES = ("last_year", "average_return", "hard_code_date")
 
@@ -330,6 +333,9 @@ class Settings:
             historical_future_extension_years=self.historical_future_extension_years,
             cashflows=list(self.cashflows),
             conditional_cashflows=list(self.conditional_cashflows),
+            accounts=list(self.accounts),
+            marital_status=self.marital_status,
+            current_age=self.current_age,
         )
 
     def retirement_end_date(self) -> Optional[dt.date]:
@@ -411,8 +417,8 @@ class Settings:
             lower_adjustment_fraction=data.get("lower_adjustment_fraction", 0.1),
             adjustment_threshold=data.get("adjustment_threshold", 0.05),
             adjustment_frequency=data.get("adjustment_frequency", "Quarterly"),
-            spending_cap_option=data.get("spending_cap_option", "Unlimited"),
-            spending_floor_option=data.get("spending_floor_option", "Unlimited"),
+            spending_cap_option=data.get("spending_cap_option", "150%"),
+            spending_floor_option=data.get("spending_floor_option", "75%"),
             shiller_extension_mode=data.get("shiller_extension_mode", "hard_code_date"),
             final_value_target=data.get("final_value_target", 0.0),
             final_value_target_ramp_down=data.get("final_value_target_ramp_down", True),

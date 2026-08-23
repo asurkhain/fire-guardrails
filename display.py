@@ -7,6 +7,7 @@ import datetime
 from typing import Optional, Tuple
 import shiller_utils
 import utils
+from tax_utils import summarize_tax_metrics_from_results
 
 MONTHS_PER_YEAR = 12
 
@@ -151,6 +152,7 @@ def update_guardrail_dynamic_labels(gr_params: dict, cashflows: list):
 def render_simulation_results(
     results_df: pd.DataFrame,
     fixed_monthly_withdrawal: Optional[float] = None,
+    current_age: Optional[float] = None,
 ) -> None:
     """
     Renders charts and summaries for simulation results.
@@ -350,10 +352,15 @@ def render_simulation_results(
             row=2,
             col=1
         )
+    guardrail_wd = (
+        results_df['Tax_Inclusive_Withdrawal']
+        if 'Tax_Inclusive_Withdrawal' in results_df.columns
+        else results_df['Withdrawal']
+    )
     fig.add_trace(
         go.Scatter(
             x=results_df['Date'],
-            y=results_df['Withdrawal'] * yearly_scale / initial_portfolio_value,
+            y=guardrail_wd * yearly_scale / initial_portfolio_value,
             mode='lines',
             name='Guardrail W/D Rate',
             line=dict(color='#1f77b4', dash='dot'),
@@ -363,14 +370,18 @@ def render_simulation_results(
         col=1
     )
     if initial_portfolio_value:
+        if 'Fixed_Tax_Inclusive_Withdrawal' in results_df.columns:
+            fixed_wd_series = results_df['Fixed_Tax_Inclusive_Withdrawal'] * yearly_scale / initial_portfolio_value
+        elif 'Fixed_SR_Withdrawal' in results_df.columns:
+            fixed_wd_series = results_df['Fixed_SR_Withdrawal'] * yearly_scale / initial_portfolio_value
+        else:
+            first_wd = float(guardrail_wd.iloc[0]) if not results_df.empty else init_withdrawal
+            fixed_wd_series = [first_wd * yearly_scale / initial_portfolio_value] * len(results_df)
+
         fig.add_trace(
             go.Scatter(
                 x=results_df['Date'],
-                y=(
-                    results_df['Fixed_SR_Withdrawal'] * yearly_scale / initial_portfolio_value
-                    if (fixed_monthly_withdrawal is not None and 'Fixed_SR_Withdrawal' in results_df.columns)
-                    else [init_withdrawal * yearly_scale / initial_portfolio_value] * len(results_df)
-                ),
+                y=fixed_wd_series,
                 mode='lines',
                 name='Initial W/D Rate' if fixed_monthly_withdrawal is None else 'Fixed W/D Rate',
                 line=dict(color='#7f7f7f', dash='dot'),
@@ -380,7 +391,20 @@ def render_simulation_results(
             col=1
         )
 
-    if 'CAPE_Withdrawal' in results_df.columns and initial_portfolio_value:
+    if 'CAPE_Tax_Inclusive_Withdrawal' in results_df.columns and initial_portfolio_value:
+        fig.add_trace(
+            go.Scatter(
+                x=results_df['Date'],
+                y=results_df['CAPE_Tax_Inclusive_Withdrawal'] * yearly_scale / initial_portfolio_value,
+                mode='lines',
+                name='CAPE W/D Rate',
+                line=dict(color='#ff7f0e', dash='dot'),
+                hovertemplate='<b>%{fullData.name}</b>: %{y:.2%}<extra></extra>'
+            ),
+            row=3,
+            col=1
+        )
+    elif 'CAPE_Withdrawal' in results_df.columns and initial_portfolio_value:
         fig.add_trace(
             go.Scatter(
                 x=results_df['Date'],
@@ -394,7 +418,20 @@ def render_simulation_results(
             col=1
         )
 
-    if 'VPW_Withdrawal' in results_df.columns and initial_portfolio_value:
+    if 'VPW_Tax_Inclusive_Withdrawal' in results_df.columns and initial_portfolio_value:
+        fig.add_trace(
+            go.Scatter(
+                x=results_df['Date'],
+                y=results_df['VPW_Tax_Inclusive_Withdrawal'] * yearly_scale / initial_portfolio_value,
+                mode='lines',
+                name='VPW W/D Rate',
+                line=dict(color='#e377c2', dash='dot'),
+                hovertemplate='<b>%{fullData.name}</b>: %{y:.2%}<extra></extra>'
+            ),
+            row=3,
+            col=1
+        )
+    elif 'VPW_Withdrawal' in results_df.columns and initial_portfolio_value:
         fig.add_trace(
             go.Scatter(
                 x=results_df['Date'],
@@ -517,6 +554,146 @@ def render_simulation_results(
 
     st.plotly_chart(fig, use_container_width=True, config={'scrollZoom': False})
 
+    if "Tax_Rate" in results_df.columns:
+        strategy_summaries = _collect_strategy_tax_summaries(
+            results_df,
+            initial_portfolio=initial_portfolio_value,
+            current_age=current_age,
+        )
+        if strategy_summaries:
+            st.markdown("**Lifetime Tax & Efficiency**")
+            st.table(
+                _build_strategy_tax_metric_table(
+                    strategy_summaries,
+                    _SIM_LIFETIME_TAX_METRICS,
+                )
+            )
+
+            st.markdown("**ACA & Healthcare Diagnostics**")
+            st.table(
+                _build_strategy_tax_metric_table(
+                    strategy_summaries,
+                    _SIM_ACA_TAX_METRICS,
+                )
+            )
+
+    if "Tax_Rate" in results_df.columns:
+        fig_tax_rate = go.Figure()
+        tax_rate_strategies = (
+            ("Guardrails", "Tax_Rate", "Tax_Paid", "#1f77b4"),
+            ("Fixed", "Fixed_Tax_Rate", "Fixed_Tax_Paid", "#7f7f7f"),
+            ("CAPE", "CAPE_Tax_Rate", "CAPE_Tax_Paid", "#ff7f0e"),
+            ("VPW", "VPW_Tax_Rate", "VPW_Tax_Paid", "#e377c2"),
+        )
+        for name, rate_column, tax_column, color in tax_rate_strategies:
+            if rate_column not in results_df.columns:
+                continue
+            annual_tax_data = results_df[["Date", rate_column, tax_column]].copy()
+            annual_tax_data["Year"] = pd.to_datetime(annual_tax_data["Date"]).dt.year
+            withdrawal_column = rate_column.replace("Tax_Rate", "Tax_Inclusive_Withdrawal")
+            annual_tax_data["Tax_Inclusive_Withdrawal"] = pd.to_numeric(
+                results_df.get(withdrawal_column, 0.0), errors="coerce"
+            ).fillna(0.0)
+            annual_tax_data[tax_column] = pd.to_numeric(annual_tax_data[tax_column], errors="coerce").fillna(0.0)
+            annual_tax_data = annual_tax_data.groupby("Year", as_index=False).agg(
+                {tax_column: "sum", "Tax_Inclusive_Withdrawal": "sum"}
+            )
+            annual_tax_data["Tax_Rate"] = np.where(
+                annual_tax_data["Tax_Inclusive_Withdrawal"] > 0.0,
+                annual_tax_data[tax_column] / annual_tax_data["Tax_Inclusive_Withdrawal"],
+                0.0,
+            )
+            fig_tax_rate.add_trace(
+                go.Scatter(
+                    x=annual_tax_data["Year"],
+                    y=annual_tax_data["Tax_Rate"],
+                    mode="lines",
+                    name=name,
+                    line=dict(color=color),
+                    customdata=np.column_stack([
+                        annual_tax_data[tax_column],
+                        annual_tax_data["Tax_Inclusive_Withdrawal"],
+                    ]),
+                    hovertemplate=(
+                        f"<b>{name}</b><br>Year: %{{x}}<br>Tax rate: %{{y:.2%}}"
+                        "<br>Taxes paid: $%{customdata[0]:,.0f}"
+                        "<br>Tax-inclusive withdrawal: $%{customdata[1]:,.0f}<extra></extra>"
+                    ),
+                )
+            )
+        if "Taxable_Accounts_Balance" in results_df.columns:
+            balances = pd.to_numeric(results_df["Taxable_Accounts_Balance"], errors="coerce").fillna(0.0)
+            if float(balances.iloc[0]) > 1e-9:
+                depleted_mask = balances <= 1e-9
+                if depleted_mask.any():
+                    depleted_year = int(pd.to_datetime(results_df.loc[depleted_mask, "Date"]).iloc[0].year)
+                    fig_tax_rate.add_vline(
+                        x=depleted_year,
+                        line_dash="dash",
+                        line_color="#9467bd",
+                        annotation_text="Taxable Accounts Depleted",
+                        annotation_position="top left",
+                    )
+        fig_tax_rate.update_layout(
+            title="Tax Rate Over Time",
+            xaxis_title="Year",
+            yaxis_title="Taxes Paid / Tax-Inclusive Withdrawal",
+            yaxis=dict(tickformat=".2%", rangemode="tozero"),
+            hovermode="x unified",
+            height=360,
+            margin=dict(l=10, r=10, t=60, b=40),
+        )
+        st.plotly_chart(fig_tax_rate, use_container_width=True, config={"scrollZoom": False})
+
+        fig_aca = go.Figure()
+        aca_strategies = (
+            ("Guardrails", "ACA_Surcharge", "#1f77b4"),
+            ("Fixed", "Fixed_ACA_Surcharge", "#7f7f7f"),
+            ("CAPE", "CAPE_ACA_Surcharge", "#ff7f0e"),
+            ("VPW", "VPW_ACA_Surcharge", "#e377c2"),
+        )
+        for name, surcharge_column, color in aca_strategies:
+            if surcharge_column not in results_df.columns:
+                continue
+            annual_aca = pd.DataFrame({
+                "Year": pd.to_datetime(results_df["Date"]).dt.year,
+                "ACA_Surcharge": pd.to_numeric(results_df[surcharge_column], errors="coerce").fillna(0.0),
+            }).groupby("Year", as_index=False)["ACA_Surcharge"].sum()
+            fig_aca.add_trace(
+                go.Scatter(
+                    x=annual_aca["Year"],
+                    y=annual_aca["ACA_Surcharge"],
+                    mode="lines",
+                    name=name,
+                    line=dict(color=color),
+                    hovertemplate=(
+                        f"<b>{name}</b><br>Year: %{{x}}<br>ACA surcharge: $%{{y:,.0f}}<extra></extra>"
+                    ),
+                )
+            )
+        medicare_year = None
+        if current_age is not None and "Date" in results_df.columns:
+            start_year = int(pd.to_datetime(results_df["Date"]).iloc[0].year)
+            medicare_year = start_year + max(0, 65 - int(current_age))
+        if medicare_year is not None:
+            fig_aca.add_vline(
+                x=medicare_year,
+                line_dash="dash",
+                line_color="#444444",
+                annotation_text="Age 65 (Medicare)",
+                annotation_position="top right",
+            )
+        fig_aca.update_layout(
+            title="ACA Surcharge Paid by Year",
+            xaxis_title="Year",
+            yaxis_title="ACA Surcharge Paid ($)",
+            yaxis=dict(tickprefix="$", tickformat=",.0f", rangemode="tozero"),
+            hovermode="x unified",
+            height=360,
+            margin=dict(l=10, r=10, t=60, b=40),
+        )
+        st.plotly_chart(fig_aca, use_container_width=True, config={"scrollZoom": False})
+
     final_summary_rows = [
         {
             "Strategy": "Guardrails",
@@ -556,35 +733,71 @@ def render_simulation_results(
     st.table(final_summary_df)
 
     num_months = len(results_df)
-    total_fixed = float(results_df['Fixed_SR_Withdrawal'].sum()) if 'Fixed_SR_Withdrawal' in results_df.columns else float(init_withdrawal) * num_months
-    total_guardrails = float(results_df['Withdrawal'].sum())
-    total_cashflow = float(results_df['Net_Cashflow'].sum()) if 'Net_Cashflow' in results_df.columns else 0.0
-    total_spending_guardrails = float(results_df['Total_Spending'].sum()) if 'Total_Spending' in results_df.columns else total_guardrails + total_cashflow
-    total_spending_fixed = float(results_df['Fixed_SR_Total_Spending'].sum()) if 'Fixed_SR_Total_Spending' in results_df.columns else total_fixed + total_cashflow
-    avg_yearly_fixed_withdrawal = (total_fixed / num_months * yearly_scale) if num_months else None
-    avg_yearly_guardrail_withdrawal = (total_guardrails / num_months * yearly_scale) if num_months else None
-    avg_yearly_fixed_spending = (total_spending_fixed / num_months * yearly_scale) if num_months else None
-    avg_yearly_guardrail_spending = (total_spending_guardrails / num_months * yearly_scale) if num_months else None
+    guardrail_wd_col = 'Tax_Inclusive_Withdrawal' if 'Tax_Inclusive_Withdrawal' in results_df.columns else 'Withdrawal'
+    fixed_wd_col = 'Fixed_Tax_Inclusive_Withdrawal' if 'Fixed_Tax_Inclusive_Withdrawal' in results_df.columns else 'Fixed_SR_Withdrawal'
+    cape_wd_col = 'CAPE_Tax_Inclusive_Withdrawal' if 'CAPE_Tax_Inclusive_Withdrawal' in results_df.columns else 'CAPE_Withdrawal'
+    vpw_wd_col = 'VPW_Tax_Inclusive_Withdrawal' if 'VPW_Tax_Inclusive_Withdrawal' in results_df.columns else 'VPW_Withdrawal'
 
-    has_cape = 'CAPE_Withdrawal' in results_df.columns
-    has_vpw = 'VPW_Withdrawal' in results_df.columns
-    if has_cape:
-        total_cape_withdrawal = float(results_df['CAPE_Withdrawal'].sum())
-        total_cape_spending = float(results_df['CAPE_Total_Spending'].sum())
-        avg_yearly_cape_withdrawal = (total_cape_withdrawal / num_months * yearly_scale) if num_months else None
-        avg_yearly_cape_spending = (total_cape_spending / num_months * yearly_scale) if num_months else None
+    def _get_active_df(df: pd.DataFrame, success_col: str) -> pd.DataFrame:
+        if success_col in df.columns:
+            succ = df[success_col].astype(bool)
+            if not succ.all():
+                first_fail = succ.idxmin()
+                return df.loc[:first_fail]
+        return df
+
+    gr_df = _get_active_df(results_df, 'Guardrail_Success')
+    fixed_df = _get_active_df(results_df, 'Fixed_Success')
+    cape_df = _get_active_df(results_df, 'CAPE_Success')
+    vpw_df = _get_active_df(results_df, 'VPW_Success')
+
+    gr_wd = gr_df[guardrail_wd_col].astype(float) if guardrail_wd_col in gr_df.columns else gr_df['Withdrawal'].astype(float)
+    gr_sp = gr_df['Total_Spending'].astype(float) if 'Total_Spending' in gr_df.columns else gr_wd
+
+    avg_yearly_guardrail_withdrawal = float(gr_wd.mean() * yearly_scale) if not gr_wd.empty else None
+    avg_yearly_guardrail_spending = float(gr_sp.mean() * yearly_scale) if not gr_sp.empty else None
+    median_yearly_guardrail_withdrawal = float(gr_wd.median() * yearly_scale) if not gr_wd.empty else None
+    median_yearly_guardrail_spending = float(gr_sp.median() * yearly_scale) if not gr_sp.empty else None
+
+    if fixed_wd_col in fixed_df.columns:
+        fixed_wd = fixed_df[fixed_wd_col].astype(float)
+    elif 'Fixed_SR_Withdrawal' in fixed_df.columns:
+        fixed_wd = fixed_df['Fixed_SR_Withdrawal'].astype(float)
     else:
-        avg_yearly_cape_withdrawal = None
-        avg_yearly_cape_spending = None
+        fixed_wd = pd.Series([init_withdrawal] * len(fixed_df))
+
+    if 'Fixed_SR_Total_Spending' in fixed_df.columns:
+        fixed_sp = fixed_df['Fixed_SR_Total_Spending'].astype(float)
+    else:
+        fixed_sp = fixed_wd
+
+    avg_yearly_fixed_withdrawal = float(fixed_wd.mean() * yearly_scale) if not fixed_wd.empty else None
+    avg_yearly_fixed_spending = float(fixed_sp.mean() * yearly_scale) if not fixed_sp.empty else None
+    median_yearly_fixed_withdrawal = float(fixed_wd.median() * yearly_scale) if not fixed_wd.empty else None
+    median_yearly_fixed_spending = float(fixed_sp.median() * yearly_scale) if not fixed_sp.empty else None
+
+    has_cape = cape_wd_col in results_df.columns or 'CAPE_Withdrawal' in results_df.columns
+    has_vpw = vpw_wd_col in results_df.columns or 'VPW_Withdrawal' in results_df.columns
+
+    if has_cape:
+        cape_wd = cape_df[cape_wd_col].astype(float) if cape_wd_col in cape_df.columns else cape_df['CAPE_Withdrawal'].astype(float)
+        cape_sp = cape_df['CAPE_Total_Spending'].astype(float) if 'CAPE_Total_Spending' in cape_df.columns else cape_wd
+        avg_yearly_cape_withdrawal = float(cape_wd.mean() * yearly_scale) if not cape_wd.empty else None
+        avg_yearly_cape_spending = float(cape_sp.mean() * yearly_scale) if not cape_sp.empty else None
+        median_yearly_cape_withdrawal = float(cape_wd.median() * yearly_scale) if not cape_wd.empty else None
+        median_yearly_cape_spending = float(cape_sp.median() * yearly_scale) if not cape_sp.empty else None
+    else:
+        avg_yearly_cape_withdrawal = avg_yearly_cape_spending = median_yearly_cape_withdrawal = median_yearly_cape_spending = None
 
     if has_vpw:
-        total_vpw_withdrawal = float(results_df['VPW_Withdrawal'].sum())
-        total_vpw_spending = float(results_df['VPW_Total_Spending'].sum())
-        avg_yearly_vpw_withdrawal = (total_vpw_withdrawal / num_months * yearly_scale) if num_months else None
-        avg_yearly_vpw_spending = (total_vpw_spending / num_months * yearly_scale) if num_months else None
+        vpw_wd = vpw_df[vpw_wd_col].astype(float) if vpw_wd_col in vpw_df.columns else vpw_df['VPW_Withdrawal'].astype(float)
+        vpw_sp = vpw_df['VPW_Total_Spending'].astype(float) if 'VPW_Total_Spending' in vpw_df.columns else vpw_wd
+        avg_yearly_vpw_withdrawal = float(vpw_wd.mean() * yearly_scale) if not vpw_wd.empty else None
+        avg_yearly_vpw_spending = float(vpw_sp.mean() * yearly_scale) if not vpw_sp.empty else None
+        median_yearly_vpw_withdrawal = float(vpw_wd.median() * yearly_scale) if not vpw_wd.empty else None
+        median_yearly_vpw_spending = float(vpw_sp.median() * yearly_scale) if not vpw_sp.empty else None
     else:
-        avg_yearly_vpw_withdrawal = None
-        avg_yearly_vpw_spending = None
+        avg_yearly_vpw_withdrawal = avg_yearly_vpw_spending = median_yearly_vpw_withdrawal = median_yearly_vpw_spending = None
 
     withdrawal_diff_ratio = (
         (avg_yearly_guardrail_withdrawal - avg_yearly_fixed_withdrawal) / avg_yearly_fixed_withdrawal
@@ -597,38 +810,47 @@ def render_simulation_results(
         else None
     )
 
-    if 'Total_Spending' in results_df.columns:
-        spending_series = results_df['Total_Spending'].astype(float)
-    else:
-        spending_series = results_df['Withdrawal'].astype(float) if 'Withdrawal' in results_df.columns else pd.Series(dtype=float)
-        if 'Net_Cashflow' in results_df.columns and not spending_series.empty:
-            spending_series = spending_series + results_df['Net_Cashflow'].astype(float)
+    start_spending = float(gr_sp.iloc[0] * yearly_scale) if not gr_sp.empty else None
+    median_spending = float(gr_sp.median() * yearly_scale) if not gr_sp.empty else None
+    min_spending = float(gr_sp.min() * yearly_scale) if not gr_sp.empty else None
+    max_spending = float(gr_sp.max() * yearly_scale) if not gr_sp.empty else None
 
-    start_spending = float(spending_series.iloc[0] * yearly_scale) if not spending_series.empty else None
-    median_spending = float(spending_series.median() * yearly_scale) if not spending_series.empty else None
-    min_spending = float(spending_series.min() * yearly_scale) if not spending_series.empty else None
-    max_spending = float(spending_series.max() * yearly_scale) if not spending_series.empty else None
+    start_wd = float(gr_wd.iloc[0] * yearly_scale) if not gr_wd.empty else None
+    median_wd = float(gr_wd.median() * yearly_scale) if not gr_wd.empty else None
+    min_wd = float(gr_wd.min() * yearly_scale) if not gr_wd.empty else None
+    max_wd = float(gr_wd.max() * yearly_scale) if not gr_wd.empty else None
 
     if has_cape:
-        cape_spending_series = results_df['CAPE_Total_Spending'].astype(float)
-        cape_start_spending = float(cape_spending_series.iloc[0] * yearly_scale)
-        cape_median_spending = float(cape_spending_series.median() * yearly_scale)
-        cape_min_spending = float(cape_spending_series.min() * yearly_scale)
-        cape_max_spending = float(cape_spending_series.max() * yearly_scale)
+        cape_start_spending = float(cape_sp.iloc[0] * yearly_scale) if not cape_sp.empty else None
+        cape_median_spending = float(cape_sp.median() * yearly_scale) if not cape_sp.empty else None
+        cape_min_spending = float(cape_sp.min() * yearly_scale) if not cape_sp.empty else None
+        cape_max_spending = float(cape_sp.max() * yearly_scale) if not cape_sp.empty else None
+
+        cape_start_wd = float(cape_wd.iloc[0] * yearly_scale) if not cape_wd.empty else None
+        cape_median_wd = float(cape_wd.median() * yearly_scale) if not cape_wd.empty else None
+        cape_min_wd = float(cape_wd.min() * yearly_scale) if not cape_wd.empty else None
+        cape_max_wd = float(cape_wd.max() * yearly_scale) if not cape_wd.empty else None
     else:
         cape_start_spending = cape_median_spending = cape_min_spending = cape_max_spending = None
+        cape_start_wd = cape_median_wd = cape_min_wd = cape_max_wd = None
 
     if has_vpw:
-        vpw_spending_series = results_df['VPW_Total_Spending'].astype(float)
-        vpw_start_spending = float(vpw_spending_series.iloc[0] * yearly_scale)
-        vpw_median_spending = float(vpw_spending_series.median() * yearly_scale)
-        vpw_min_spending = float(vpw_spending_series.min() * yearly_scale)
-        vpw_max_spending = float(vpw_spending_series.max() * yearly_scale)
+        vpw_start_spending = float(vpw_sp.iloc[0] * yearly_scale) if not vpw_sp.empty else None
+        vpw_median_spending = float(vpw_sp.median() * yearly_scale) if not vpw_sp.empty else None
+        vpw_min_spending = float(vpw_sp.min() * yearly_scale) if not vpw_sp.empty else None
+        vpw_max_spending = float(vpw_sp.max() * yearly_scale) if not vpw_sp.empty else None
+
+        vpw_start_wd = float(vpw_wd.iloc[0] * yearly_scale) if not vpw_wd.empty else None
+        vpw_median_wd = float(vpw_wd.median() * yearly_scale) if not vpw_wd.empty else None
+        vpw_min_wd = float(vpw_wd.min() * yearly_scale) if not vpw_wd.empty else None
+        vpw_max_wd = float(vpw_wd.max() * yearly_scale) if not vpw_wd.empty else None
     else:
-        vpw_spending_series = pd.Series(dtype=float)
         vpw_start_spending = vpw_median_spending = vpw_min_spending = vpw_max_spending = None
+        vpw_start_wd = vpw_median_wd = vpw_min_wd = vpw_max_wd = None
 
     def _longest_run(values, target):
+        if values is None or values.empty or target is None:
+            return 0
         longest = 0
         current = 0
         for val in values:
@@ -639,18 +861,18 @@ def render_simulation_results(
                 current = 0
         return longest
 
-    monthly_min = float(spending_series.min()) if not spending_series.empty else None
-    monthly_med = float(spending_series.median()) if not spending_series.empty else None
-    monthly_max = float(spending_series.max()) if not spending_series.empty else None
-    min_streak = _longest_run(spending_series, monthly_min) if monthly_min is not None else 0
-    med_streak = _longest_run(spending_series, monthly_med) if monthly_med is not None else 0
-    max_streak = _longest_run(spending_series, monthly_max) if monthly_max is not None else 0
-    cape_min_streak = _longest_run(cape_spending_series, float(cape_spending_series.min())) if has_cape else 0
-    cape_med_streak = _longest_run(cape_spending_series, float(cape_spending_series.median())) if has_cape else 0
-    cape_max_streak = _longest_run(cape_spending_series, float(cape_spending_series.max())) if has_cape else 0
-    vpw_min_streak = _longest_run(vpw_spending_series, float(vpw_spending_series.min())) if has_vpw else 0
-    vpw_med_streak = _longest_run(vpw_spending_series, float(vpw_spending_series.median())) if has_vpw else 0
-    vpw_max_streak = _longest_run(vpw_spending_series, float(vpw_spending_series.max())) if has_vpw else 0
+    monthly_min = float(gr_sp.min()) if not gr_sp.empty else None
+    monthly_med = float(gr_sp.median()) if not gr_sp.empty else None
+    monthly_max = float(gr_sp.max()) if not gr_sp.empty else None
+    min_streak = _longest_run(gr_sp, monthly_min)
+    med_streak = _longest_run(gr_sp, monthly_med)
+    max_streak = _longest_run(gr_sp, monthly_max)
+    cape_min_streak = _longest_run(cape_sp, float(cape_sp.min())) if has_cape and not cape_sp.empty else 0
+    cape_med_streak = _longest_run(cape_sp, float(cape_sp.median())) if has_cape and not cape_sp.empty else 0
+    cape_max_streak = _longest_run(cape_sp, float(cape_sp.max())) if has_cape and not cape_sp.empty else 0
+    vpw_min_streak = _longest_run(vpw_sp, float(vpw_sp.min())) if has_vpw and not vpw_sp.empty else 0
+    vpw_med_streak = _longest_run(vpw_sp, float(vpw_sp.median())) if has_vpw and not vpw_sp.empty else 0
+    vpw_max_streak = _longest_run(vpw_sp, float(vpw_sp.max())) if has_vpw and not vpw_sp.empty else 0
 
     def _fmt_pct_diff(new_value, baseline):
         if new_value is None or baseline in (None, 0):
@@ -662,8 +884,6 @@ def render_simulation_results(
             return "N/A"
         return f"{value / base:.2%}"
 
-    # Baseline for "Duration Below": compare against Fixed Yearly
-    # Withdrawal if provided, otherwise fall back to the initial spending amount.
     baseline_comparison = (
         float(fixed_monthly_withdrawal)
         if fixed_monthly_withdrawal is not None
@@ -683,11 +903,25 @@ def render_simulation_results(
                 "VPW": _fmt_rate(avg_yearly_vpw_withdrawal, initial_portfolio_value) if has_vpw else "N/A",
             },
             {
+                "Metric": "Median Annual Withdrawal Rate",
+                "Fixed": _fmt_rate(median_yearly_fixed_withdrawal, initial_portfolio_value),
+                "Guardrails": _fmt_rate(median_yearly_guardrail_withdrawal, initial_portfolio_value),
+                "CAPE": _fmt_rate(median_yearly_cape_withdrawal, initial_portfolio_value) if has_cape else "N/A",
+                "VPW": _fmt_rate(median_yearly_vpw_withdrawal, initial_portfolio_value) if has_vpw else "N/A",
+            },
+            {
                 "Metric": "Avg Annual Spending Rate",
                 "Fixed": _fmt_rate(avg_yearly_fixed_spending, initial_portfolio_value),
                 "Guardrails": _fmt_rate(avg_yearly_guardrail_spending, initial_portfolio_value),
                 "CAPE": _fmt_rate(avg_yearly_cape_spending, initial_portfolio_value) if has_cape else "N/A",
                 "VPW": _fmt_rate(avg_yearly_vpw_spending, initial_portfolio_value) if has_vpw else "N/A",
+            },
+            {
+                "Metric": "Median Annual Spending Rate",
+                "Fixed": _fmt_rate(median_yearly_fixed_spending, initial_portfolio_value),
+                "Guardrails": _fmt_rate(median_yearly_guardrail_spending, initial_portfolio_value),
+                "CAPE": _fmt_rate(median_yearly_cape_spending, initial_portfolio_value) if has_cape else "N/A",
+                "VPW": _fmt_rate(median_yearly_vpw_spending, initial_portfolio_value) if has_vpw else "N/A",
             },
             {
                 "Metric": "Duration Below",
@@ -706,10 +940,22 @@ def render_simulation_results(
                 "VPW": _fmt_rate(avg_yearly_vpw_withdrawal, initial_portfolio_value) if has_vpw else "N/A",
             },
             {
+                "Metric": "Median Annual Withdrawal Rate",
+                "Guardrails": _fmt_rate(median_yearly_guardrail_withdrawal, initial_portfolio_value),
+                "CAPE": _fmt_rate(median_yearly_cape_withdrawal, initial_portfolio_value) if has_cape else "N/A",
+                "VPW": _fmt_rate(median_yearly_vpw_withdrawal, initial_portfolio_value) if has_vpw else "N/A",
+            },
+            {
                 "Metric": "Avg Annual Spending Rate",
                 "Guardrails": _fmt_rate(avg_yearly_guardrail_spending, initial_portfolio_value),
                 "CAPE": _fmt_rate(avg_yearly_cape_spending, initial_portfolio_value) if has_cape else "N/A",
                 "VPW": _fmt_rate(avg_yearly_vpw_spending, initial_portfolio_value) if has_vpw else "N/A",
+            },
+            {
+                "Metric": "Median Annual Spending Rate",
+                "Guardrails": _fmt_rate(median_yearly_guardrail_spending, initial_portfolio_value),
+                "CAPE": _fmt_rate(median_yearly_cape_spending, initial_portfolio_value) if has_cape else "N/A",
+                "VPW": _fmt_rate(median_yearly_vpw_spending, initial_portfolio_value) if has_vpw else "N/A",
             },
             {
                 "Metric": "Duration Below",
@@ -723,27 +969,31 @@ def render_simulation_results(
 
     spending_rows = [
         {
-            "Metric": "Start Spending",
+            "Metric": "Guardrails Start Spending",
             "Yearly": _fmt_currency(start_spending),
-            "Withdrawal Rate": _fmt_rate(start_spending, initial_portfolio_value),
+            "Spend Rate": _fmt_rate(start_spending, initial_portfolio_value),
+            "Withdrawal Rate": _fmt_rate(start_wd, initial_portfolio_value),
             "Duration (months)": "—",
         },
         {
-            "Metric": "Min Spending",
+            "Metric": "Guardrails Min Spending",
             "Yearly": _fmt_currency(min_spending),
-            "Withdrawal Rate": _fmt_rate(min_spending, initial_portfolio_value),
+            "Spend Rate": _fmt_rate(min_spending, initial_portfolio_value),
+            "Withdrawal Rate": _fmt_rate(min_wd, initial_portfolio_value),
             "Duration (months)": f"{min_streak}" if min_streak else "—",
         },
         {
-            "Metric": "Median Spending",
+            "Metric": "Guardrails Median Spending",
             "Yearly": _fmt_currency(median_spending),
-            "Withdrawal Rate": _fmt_rate(median_spending, initial_portfolio_value),
+            "Spend Rate": _fmt_rate(median_spending, initial_portfolio_value),
+            "Withdrawal Rate": _fmt_rate(median_wd, initial_portfolio_value),
             "Duration (months)": f"{med_streak}" if med_streak else "—",
         },
         {
-            "Metric": "Max Spending",
+            "Metric": "Guardrails Max Spending",
             "Yearly": _fmt_currency(max_spending),
-            "Withdrawal Rate": _fmt_rate(max_spending, initial_portfolio_value),
+            "Spend Rate": _fmt_rate(max_spending, initial_portfolio_value),
+            "Withdrawal Rate": _fmt_rate(max_wd, initial_portfolio_value),
             "Duration (months)": f"{max_streak}" if max_streak else "—",
         },
     ]
@@ -753,25 +1003,29 @@ def render_simulation_results(
             {
                 "Metric": "CAPE Start Spending",
                 "Yearly": _fmt_currency(cape_start_spending),
-                "Withdrawal Rate": _fmt_rate(cape_start_spending, initial_portfolio_value),
+                "Spend Rate": _fmt_rate(cape_start_spending, initial_portfolio_value),
+                "Withdrawal Rate": _fmt_rate(cape_start_wd, initial_portfolio_value),
                 "Duration (months)": "—",
             },
             {
                 "Metric": "CAPE Min Spending",
                 "Yearly": _fmt_currency(cape_min_spending),
-                "Withdrawal Rate": _fmt_rate(cape_min_spending, initial_portfolio_value),
+                "Spend Rate": _fmt_rate(cape_min_spending, initial_portfolio_value),
+                "Withdrawal Rate": _fmt_rate(cape_min_wd, initial_portfolio_value),
                 "Duration (months)": f"{cape_min_streak}" if cape_min_streak else "—",
             },
             {
                 "Metric": "CAPE Median Spending",
                 "Yearly": _fmt_currency(cape_median_spending),
-                "Withdrawal Rate": _fmt_rate(cape_median_spending, initial_portfolio_value),
+                "Spend Rate": _fmt_rate(cape_median_spending, initial_portfolio_value),
+                "Withdrawal Rate": _fmt_rate(cape_median_wd, initial_portfolio_value),
                 "Duration (months)": f"{cape_med_streak}" if cape_med_streak else "—",
             },
             {
                 "Metric": "CAPE Max Spending",
                 "Yearly": _fmt_currency(cape_max_spending),
-                "Withdrawal Rate": _fmt_rate(cape_max_spending, initial_portfolio_value),
+                "Spend Rate": _fmt_rate(cape_max_spending, initial_portfolio_value),
+                "Withdrawal Rate": _fmt_rate(cape_max_wd, initial_portfolio_value),
                 "Duration (months)": f"{cape_max_streak}" if cape_max_streak else "—",
             },
         ])
@@ -781,30 +1035,168 @@ def render_simulation_results(
             {
                 "Metric": "VPW Start Spending",
                 "Yearly": _fmt_currency(vpw_start_spending),
-                "Withdrawal Rate": _fmt_rate(vpw_start_spending, initial_portfolio_value),
+                "Spend Rate": _fmt_rate(vpw_start_spending, initial_portfolio_value),
+                "Withdrawal Rate": _fmt_rate(vpw_start_wd, initial_portfolio_value),
                 "Duration (months)": "—",
             },
             {
                 "Metric": "VPW Min Spending",
                 "Yearly": _fmt_currency(vpw_min_spending),
-                "Withdrawal Rate": _fmt_rate(vpw_min_spending, initial_portfolio_value),
+                "Spend Rate": _fmt_rate(vpw_min_spending, initial_portfolio_value),
+                "Withdrawal Rate": _fmt_rate(vpw_min_wd, initial_portfolio_value),
                 "Duration (months)": f"{vpw_min_streak}" if vpw_min_streak else "—",
             },
             {
                 "Metric": "VPW Median Spending",
                 "Yearly": _fmt_currency(vpw_median_spending),
-                "Withdrawal Rate": _fmt_rate(vpw_median_spending, initial_portfolio_value),
+                "Spend Rate": _fmt_rate(vpw_median_spending, initial_portfolio_value),
+                "Withdrawal Rate": _fmt_rate(vpw_median_wd, initial_portfolio_value),
                 "Duration (months)": f"{vpw_med_streak}" if vpw_med_streak else "—",
             },
             {
                 "Metric": "VPW Max Spending",
                 "Yearly": _fmt_currency(vpw_max_spending),
-                "Withdrawal Rate": _fmt_rate(vpw_max_spending, initial_portfolio_value),
+                "Spend Rate": _fmt_rate(vpw_max_spending, initial_portfolio_value),
+                "Withdrawal Rate": _fmt_rate(vpw_max_wd, initial_portfolio_value),
                 "Duration (months)": f"{vpw_max_streak}" if vpw_max_streak else "—",
             },
         ])
 
     st.table(pd.DataFrame(spending_rows).set_index("Metric"))
+
+
+_HISTORICAL_TAX_QUANTILES = [0.05, 0.10, 0.25, 0.50, 0.75, 0.90]
+
+_HISTORICAL_TAX_METRICS = (
+    ("Lifetime_Tax_Rate", "Lifetime Effective Tax Rate", "pct"),
+    ("Pre65_Lifetime_Tax_Rate", "Pre-65 Effective Tax Rate", "pct"),
+    ("Avg_Annual_Tax_Pct", "Avg Annual Tax (% of Starting Portfolio)", "pct"),
+    ("Pre65_Avg_Annual_Tax_Pct", "Avg Pre-65 Annual Tax (% of Starting Portfolio)", "pct"),
+    ("Pre65_Subsidized_Years", "Pre-65 Subsidized Years", "years"),
+    ("Pre65_Cliff_Years", "Pre-65 Cliff Years", "years"),
+)
+
+
+def _fmt_historical_tax_percentile_value(
+    value,
+    metric_kind: str,
+) -> str:
+    if value is None or pd.isna(value):
+        return "N/A"
+    if metric_kind == "pct":
+        return f"{float(value):.1%}"
+    if metric_kind == "years":
+        return f"{float(value):.1f}"
+    return _fmt_currency(float(value))
+
+
+def _build_historical_tax_percentile_row(
+    sorted_df: pd.DataFrame,
+    results_df: pd.DataFrame,
+    col_name: str,
+    label: str,
+    metric_kind: str = "pct",
+) -> dict:
+    """Build one tax metric row using the shared historical cohort ordering."""
+    row = {"Metric": label}
+    quantile_cols = [f"{int(q * 100)}th" for q in _HISTORICAL_TAX_QUANTILES]
+    n_runs = len(sorted_df)
+
+    if col_name not in sorted_df.columns or n_runs == 0:
+        for col_key in quantile_cols:
+            row[col_key] = "N/A"
+        row["Mean"] = "N/A"
+        return row
+
+    for q, col_key in zip(_HISTORICAL_TAX_QUANTILES, quantile_cols):
+        idx = int(q * (n_runs - 1))
+        row[col_key] = _fmt_historical_tax_percentile_value(
+            sorted_df.loc[idx, col_name],
+            metric_kind,
+        )
+
+    if col_name in results_df.columns:
+        mean_series = pd.to_numeric(results_df[col_name], errors="coerce").dropna()
+        mean_val = float(mean_series.mean()) if not mean_series.empty else np.nan
+    else:
+        mean_val = np.nan
+    row["Mean"] = _fmt_historical_tax_percentile_value(mean_val, metric_kind)
+    return row
+
+
+_SIM_TAX_STRATEGIES = (
+    ("", "Guardrails"),
+    ("Fixed_", "Fixed"),
+    ("CAPE_", "CAPE"),
+    ("VPW_", "VPW"),
+)
+
+_SIM_LIFETIME_TAX_METRICS = (
+    ("Lifetime_Tax_Rate", "Lifetime Effective Tax Rate", "pct"),
+    ("Pre65_Lifetime_Tax_Rate", "Pre-65 Effective Tax Rate", "pct"),
+    ("Avg_Annual_Tax_Pct", "Avg Annual Tax (% of Initial Portfolio)", "pct2"),
+    ("Pre65_Avg_Annual_Tax_Pct", "Avg Pre-65 Annual Tax (% of Initial Portfolio)", "pct2"),
+)
+
+_SIM_ACA_TAX_METRICS = (
+    ("Pre65_Subsidized_Years", "Pre-65 Subsidized Years", "int"),
+    ("Pre65_Cliff_Years", "Pre-65 Cliff Years", "int"),
+    ("Medicare_Transition_Year", "Medicare Transition Year", "year"),
+)
+
+
+def _fmt_sim_tax_metric(value, metric_kind: str) -> str:
+    if value is None or pd.isna(value):
+        return "N/A"
+    if metric_kind == "pct":
+        return f"{float(value):.1%}"
+    if metric_kind == "pct2":
+        return f"{float(value):.2%}"
+    if metric_kind in ("int", "year"):
+        return str(int(value))
+    return str(value)
+
+
+def _collect_strategy_tax_summaries(
+    results_df: pd.DataFrame,
+    initial_portfolio: float | None,
+    current_age: float | None,
+) -> dict[str, dict]:
+    summaries: dict[str, dict] = {}
+    for prefix, strategy_label in _SIM_TAX_STRATEGIES:
+        tax_col = f"{prefix}Tax_Paid" if prefix else "Tax_Paid"
+        if tax_col not in results_df.columns:
+            continue
+        summary = summarize_tax_metrics_from_results(
+            results_df,
+            prefix=prefix,
+            initial_portfolio=initial_portfolio,
+            current_age=current_age,
+        )
+        if summary:
+            summaries[strategy_label] = summary
+    return summaries
+
+
+def _build_strategy_tax_metric_table(
+    summaries: dict[str, dict],
+    metric_defs: tuple[tuple[str, str, str], ...],
+) -> pd.DataFrame:
+    rows = []
+    strategy_labels = [label for _, label in _SIM_TAX_STRATEGIES]
+    for metric_key, metric_label, metric_kind in metric_defs:
+        row = {"Metric": metric_label}
+        for strategy_label in strategy_labels:
+            summary = summaries.get(strategy_label)
+            if summary is None:
+                row[strategy_label] = "N/A"
+            else:
+                row[strategy_label] = _fmt_sim_tax_metric(
+                    summary.get(metric_key),
+                    metric_kind,
+                )
+        rows.append(row)
+    return pd.DataFrame(rows).set_index("Metric")
 
 
 def _percentile_summary(series: pd.Series, label: str, is_pct: bool = False) -> dict:
@@ -1124,6 +1516,7 @@ def render_historical_results(
     results_df: pd.DataFrame,
     calculation_time_seconds: Optional[float] = None,
     fixed_monthly_withdrawal: Optional[float] = None,
+    fixed_yearly_withdrawal_including_taxes: Optional[float] = None,
 ) -> None:
     """Render summary, charts, and per-retirement table for Historical Mode."""
     if results_df is None or results_df.empty:
@@ -1132,6 +1525,11 @@ def render_historical_results(
 
     yearly_scale = float(MONTHS_PER_YEAR)
     fixed_yearly_withdrawal = monthly_to_yearly(fixed_monthly_withdrawal)
+    effective_fixed_yearly_withdrawal = (
+        fixed_yearly_withdrawal_including_taxes
+        if fixed_yearly_withdrawal_including_taxes is not None
+        else fixed_yearly_withdrawal
+    )
 
     st.subheader("Historical Mode Summary")
     st.caption(
@@ -1195,13 +1593,23 @@ def render_historical_results(
             "Mean Avg Spend Rate": fmt_mean_rate("avg_spending", yearly_scale),
             "Mean Median Spend Rate": fmt_mean_rate("median_spending", yearly_scale),
             "Mean Min Spend Rate": fmt_mean_rate("min_spending", yearly_scale),
+            "Mean Median Withdrawal Rate": fmt_mean_rate("median_withdrawal", yearly_scale),
             "Mean Duration Below Initial": fmt_mean_pct("pct_below_initial"),
         },
     ]
 
     if has_fixed:
         fixed_success_rate = float(results_df["Fixed_Success"].mean())
-        fixed_spend_rate = f"{fixed_yearly_withdrawal / starting_portfolio:.2%}" if starting_portfolio else "N/A"
+        fixed_spend_rate = (
+            f"{fixed_yearly_withdrawal / starting_portfolio:.2%}"
+            if starting_portfolio and fixed_yearly_withdrawal
+            else "N/A"
+        )
+        fixed_withdrawal_rate = (
+            f"{effective_fixed_yearly_withdrawal / starting_portfolio:.2%}"
+            if starting_portfolio and effective_fixed_yearly_withdrawal
+            else "N/A"
+        )
         summary_rows.append(
             {
                 "Strategy": f"Fixed Withdrawal",
@@ -1210,6 +1618,7 @@ def render_historical_results(
                 "Mean Avg Spend Rate": fixed_spend_rate,
                 "Mean Median Spend Rate": fixed_spend_rate,
                 "Mean Min Spend Rate": fixed_spend_rate,
+                "Mean Median Withdrawal Rate": fixed_withdrawal_rate,
                 "Mean Duration Below Initial": "N/A",
             }
         )
@@ -1222,6 +1631,7 @@ def render_historical_results(
                 "Mean Avg Spend Rate": "N/A",
                 "Mean Median Spend Rate": "N/A",
                 "Mean Min Spend Rate": "N/A",
+                "Mean Median Withdrawal Rate": "N/A",
                 "Mean Duration Below Initial": "N/A",
             }
         )
@@ -1235,6 +1645,7 @@ def render_historical_results(
                 "Mean Avg Spend Rate": fmt_mean_rate("CAPE_Average_Withdrawal"),
                 "Mean Median Spend Rate": fmt_mean_rate("CAPE_Median_Withdrawal"),
                 "Mean Min Spend Rate": fmt_mean_rate("CAPE_Minimum_Withdrawal"),
+                "Mean Median Withdrawal Rate": fmt_mean_rate("CAPE_Median_Actual_Withdrawal") if "CAPE_Median_Actual_Withdrawal" in results_df.columns else fmt_mean_rate("CAPE_Median_Withdrawal"),
                 "Mean Duration Below Initial": fmt_mean_pct("CAPE_Pct_Below_Fixed"),
             }
         )
@@ -1247,6 +1658,7 @@ def render_historical_results(
                 "Mean Avg Spend Rate": "N/A",
                 "Mean Median Spend Rate": "N/A",
                 "Mean Min Spend Rate": "N/A",
+                "Mean Median Withdrawal Rate": "N/A",
                 "Mean Duration Below Initial": "N/A",
             }
         ) 
@@ -1261,6 +1673,7 @@ def render_historical_results(
                 "Mean Avg Spend Rate": fmt_mean_rate("VPW_Average_Withdrawal"),
                 "Mean Median Spend Rate": fmt_mean_rate("VPW_Median_Withdrawal"),
                 "Mean Min Spend Rate": fmt_mean_rate("VPW_Minimum_Withdrawal"),
+                "Mean Median Withdrawal Rate": fmt_mean_rate("VPW_Median_Actual_Withdrawal") if "VPW_Median_Actual_Withdrawal" in results_df.columns else fmt_mean_rate("VPW_Median_Withdrawal"),
                 "Mean Duration Below Initial": fmt_mean_pct("VPW_Pct_Below_Fixed"),
             }
         )
@@ -1273,6 +1686,7 @@ def render_historical_results(
                 "Mean Avg Spend Rate": "N/A",
                 "Mean Median Spend Rate": "N/A",
                 "Mean Min Spend Rate": "N/A",
+                "Mean Median Withdrawal Rate": "N/A",
                 "Mean Duration Below Initial": "N/A",
             }
         )
@@ -1286,16 +1700,55 @@ def render_historical_results(
         results_df["max_spending_rate"] = results_df["max_spending"].astype(float) * yearly_scale / starting_portfolio
         results_df["median_spending_rate"] = results_df["median_spending"].astype(float) * yearly_scale / starting_portfolio
         results_df["avg_spending_rate"] = results_df["avg_spending"].astype(float) * yearly_scale / starting_portfolio
+
+        results_df["min_withdrawal_rate"] = pd.to_numeric(results_df.get("min_withdrawal"), errors="coerce") * yearly_scale / starting_portfolio
+        results_df["max_withdrawal_rate"] = pd.to_numeric(results_df.get("max_withdrawal"), errors="coerce") * yearly_scale / starting_portfolio
+        results_df["median_withdrawal_rate"] = pd.to_numeric(results_df.get("median_withdrawal"), errors="coerce") * yearly_scale / starting_portfolio
+        results_df["avg_withdrawal_rate"] = pd.to_numeric(results_df.get("avg_withdrawal"), errors="coerce") * yearly_scale / starting_portfolio
+
+        if has_fixed:
+            fixed_act_min = results_df["Fixed_Min_Actual_Withdrawal"] if "Fixed_Min_Actual_Withdrawal" in results_df.columns else effective_fixed_yearly_withdrawal
+            fixed_act_max = results_df["Fixed_Max_Actual_Withdrawal"] if "Fixed_Max_Actual_Withdrawal" in results_df.columns else effective_fixed_yearly_withdrawal
+            fixed_act_med = results_df["Fixed_Median_Actual_Withdrawal"] if "Fixed_Median_Actual_Withdrawal" in results_df.columns else effective_fixed_yearly_withdrawal
+            fixed_act_avg = results_df["Fixed_Average_Actual_Withdrawal"] if "Fixed_Average_Actual_Withdrawal" in results_df.columns else effective_fixed_yearly_withdrawal
+
+            results_df["Fixed_Min_WD_Rate"] = pd.to_numeric(fixed_act_min, errors="coerce") / starting_portfolio
+            results_df["Fixed_Max_WD_Rate"] = pd.to_numeric(fixed_act_max, errors="coerce") / starting_portfolio
+            results_df["Fixed_Median_WD_Rate"] = pd.to_numeric(fixed_act_med, errors="coerce") / starting_portfolio
+            results_df["Fixed_Avg_WD_Rate"] = pd.to_numeric(fixed_act_avg, errors="coerce") / starting_portfolio
+            results_df["Fixed_Spend_Rate"] = pd.to_numeric(fixed_yearly_withdrawal, errors="coerce") / starting_portfolio
+
         if has_cape:
             results_df["CAPE_Min_Spend_Rate"] = pd.to_numeric(results_df["CAPE_Minimum_Withdrawal"], errors="coerce") / starting_portfolio
             results_df["CAPE_Max_Spend_Rate"] = pd.to_numeric(results_df["CAPE_Maximum_Withdrawal"], errors="coerce") / starting_portfolio
             results_df["CAPE_Median_Spend_Rate"] = pd.to_numeric(results_df["CAPE_Median_Withdrawal"], errors="coerce") / starting_portfolio
             results_df["CAPE_Avg_Spend_Rate"] = pd.to_numeric(results_df["CAPE_Average_Withdrawal"], errors="coerce") / starting_portfolio
+
+            cape_act_min = results_df["CAPE_Min_Actual_Withdrawal"] if "CAPE_Min_Actual_Withdrawal" in results_df.columns else results_df["CAPE_Minimum_Withdrawal"]
+            cape_act_max = results_df["CAPE_Max_Actual_Withdrawal"] if "CAPE_Max_Actual_Withdrawal" in results_df.columns else results_df["CAPE_Maximum_Withdrawal"]
+            cape_act_med = results_df["CAPE_Median_Actual_Withdrawal"] if "CAPE_Median_Actual_Withdrawal" in results_df.columns else results_df["CAPE_Median_Withdrawal"]
+            cape_act_avg = results_df["CAPE_Average_Actual_Withdrawal"] if "CAPE_Average_Actual_Withdrawal" in results_df.columns else results_df["CAPE_Average_Withdrawal"]
+
+            results_df["CAPE_Min_WD_Rate"] = pd.to_numeric(cape_act_min, errors="coerce") / starting_portfolio
+            results_df["CAPE_Max_WD_Rate"] = pd.to_numeric(cape_act_max, errors="coerce") / starting_portfolio
+            results_df["CAPE_Median_WD_Rate"] = pd.to_numeric(cape_act_med, errors="coerce") / starting_portfolio
+            results_df["CAPE_Avg_WD_Rate"] = pd.to_numeric(cape_act_avg, errors="coerce") / starting_portfolio
+
         if has_vpw:
             results_df["VPW_Min_Spend_Rate"] = pd.to_numeric(results_df["VPW_Minimum_Withdrawal"], errors="coerce") / starting_portfolio
             results_df["VPW_Max_Spend_Rate"] = pd.to_numeric(results_df["VPW_Maximum_Withdrawal"], errors="coerce") / starting_portfolio
             results_df["VPW_Median_Spend_Rate"] = pd.to_numeric(results_df["VPW_Median_Withdrawal"], errors="coerce") / starting_portfolio
             results_df["VPW_Avg_Spend_Rate"] = pd.to_numeric(results_df["VPW_Average_Withdrawal"], errors="coerce") / starting_portfolio
+
+            vpw_act_min = results_df["VPW_Min_Actual_Withdrawal"] if "VPW_Min_Actual_Withdrawal" in results_df.columns else results_df["VPW_Minimum_Withdrawal"]
+            vpw_act_max = results_df["VPW_Max_Actual_Withdrawal"] if "VPW_Max_Actual_Withdrawal" in results_df.columns else results_df["VPW_Maximum_Withdrawal"]
+            vpw_act_med = results_df["VPW_Median_Actual_Withdrawal"] if "VPW_Median_Actual_Withdrawal" in results_df.columns else results_df["VPW_Median_Withdrawal"]
+            vpw_act_avg = results_df["VPW_Average_Actual_Withdrawal"] if "VPW_Average_Actual_Withdrawal" in results_df.columns else results_df["VPW_Average_Withdrawal"]
+
+            results_df["VPW_Min_WD_Rate"] = pd.to_numeric(vpw_act_min, errors="coerce") / starting_portfolio
+            results_df["VPW_Max_WD_Rate"] = pd.to_numeric(vpw_act_max, errors="coerce") / starting_portfolio
+            results_df["VPW_Median_WD_Rate"] = pd.to_numeric(vpw_act_med, errors="coerce") / starting_portfolio
+            results_df["VPW_Avg_WD_Rate"] = pd.to_numeric(vpw_act_avg, errors="coerce") / starting_portfolio
 
     # Sort the runs from worst to best based on:
     # 1. pct_below_initial descending (worst outcomes have more duration below initial)
@@ -1364,37 +1817,99 @@ def render_historical_results(
         return row
 
     percentile_rows = [
-        build_percentile_row("min_spending_rate", "Min Spend Rate", is_pct=True),
-        build_percentile_row("max_spending_rate", "Max Spend Rate", is_pct=True),
-        build_percentile_row("median_spending_rate", "Median Spend Rate", is_pct=True),
-        build_percentile_row("avg_spending_rate", "Average Spend Rate", is_pct=True),
-        build_percentile_row("pct_below_initial", "Duration Below", is_pct=True),
+        build_percentile_row("min_spending_rate", "Guardrails — Min Spend Rate", is_pct=True),
+        build_percentile_row("max_spending_rate", "Guardrails — Max Spend Rate", is_pct=True),
+        build_percentile_row("median_spending_rate", "Guardrails — Median Spend Rate", is_pct=True),
+        build_percentile_row("avg_spending_rate", "Guardrails — Average Spend Rate", is_pct=True),
+        build_percentile_row("min_withdrawal_rate", "Guardrails — Min Withdrawal Rate", is_pct=True),
+        build_percentile_row("max_withdrawal_rate", "Guardrails — Max Withdrawal Rate", is_pct=True),
+        build_percentile_row("median_withdrawal_rate", "Guardrails — Median Withdrawal Rate", is_pct=True),
+        build_percentile_row("avg_withdrawal_rate", "Guardrails — Average Withdrawal Rate", is_pct=True),
+        build_percentile_row("pct_below_initial", "Guardrails — Duration Below", is_pct=True),
     ]
 
-    if has_cape:
+    if has_fixed:
         percentile_rows.extend([
-            build_percentile_row("CAPE_Min_Spend_Rate", "CAPE Min Spend Rate", is_pct=True),
-            build_percentile_row("CAPE_Max_Spend_Rate", "CAPE Max Spend Rate", is_pct=True),
-            build_percentile_row("CAPE_Median_Spend_Rate", "CAPE Median Spend Rate", is_pct=True),
-            build_percentile_row("CAPE_Avg_Spend_Rate", "CAPE Average Spend Rate", is_pct=True),
-            build_percentile_row("CAPE_Pct_Below_Fixed", "CAPE Duration Below", is_pct=True),
-        ])
-    if has_vpw:
-        percentile_rows.extend([
-            build_percentile_row("VPW_Min_Spend_Rate", "VPW Min Spend Rate", is_pct=True),
-            build_percentile_row("VPW_Max_Spend_Rate", "VPW Max Spend Rate", is_pct=True),
-            build_percentile_row("VPW_Median_Spend_Rate", "VPW Median Spend Rate", is_pct=True),
-            build_percentile_row("VPW_Avg_Spend_Rate", "VPW Average Spend Rate", is_pct=True),
-            build_percentile_row("VPW_Pct_Below_Fixed", "VPW Duration Below", is_pct=True),
+            build_percentile_row("Fixed_Spend_Rate", "Fixed — Spend Rate", is_pct=True),
+            build_percentile_row("Fixed_Min_WD_Rate", "Fixed — Min Withdrawal Rate", is_pct=True),
+            build_percentile_row("Fixed_Max_WD_Rate", "Fixed — Max Withdrawal Rate", is_pct=True),
+            build_percentile_row("Fixed_Median_WD_Rate", "Fixed — Median Withdrawal Rate", is_pct=True),
+            build_percentile_row("Fixed_Avg_WD_Rate", "Fixed — Average Withdrawal Rate", is_pct=True),
         ])
 
-    percentile_rows.append(build_percentile_row("Guardrail_Success", "Guardrail Failure %", is_pct_flipped=True))
-    if has_fixed:
-        percentile_rows.append(build_percentile_row("Fixed_Success", "Fixed Withdrawal Failure %", is_pct_flipped=True))
     if has_cape:
-        percentile_rows.append(build_percentile_row("CAPE_Success", "CAPE Withdrawal Failure %", is_pct_flipped=True))
+        percentile_rows.extend([
+            build_percentile_row("CAPE_Min_Spend_Rate", "CAPE — Min Spend Rate", is_pct=True),
+            build_percentile_row("CAPE_Max_Spend_Rate", "CAPE — Max Spend Rate", is_pct=True),
+            build_percentile_row("CAPE_Median_Spend_Rate", "CAPE — Median Spend Rate", is_pct=True),
+            build_percentile_row("CAPE_Avg_Spend_Rate", "CAPE — Average Spend Rate", is_pct=True),
+            build_percentile_row("CAPE_Min_WD_Rate", "CAPE — Min Withdrawal Rate", is_pct=True),
+            build_percentile_row("CAPE_Max_WD_Rate", "CAPE — Max Withdrawal Rate", is_pct=True),
+            build_percentile_row("CAPE_Median_WD_Rate", "CAPE — Median Withdrawal Rate", is_pct=True),
+            build_percentile_row("CAPE_Avg_WD_Rate", "CAPE — Average Withdrawal Rate", is_pct=True),
+            build_percentile_row("CAPE_Pct_Below_Fixed", "CAPE — Duration Below", is_pct=True),
+        ])
     if has_vpw:
-        percentile_rows.append(build_percentile_row("VPW_Success", "VPW Withdrawal Failure %", is_pct_flipped=True))
+        percentile_rows.extend([
+            build_percentile_row("VPW_Min_Spend_Rate", "VPW — Min Spend Rate", is_pct=True),
+            build_percentile_row("VPW_Max_Spend_Rate", "VPW — Max Spend Rate", is_pct=True),
+            build_percentile_row("VPW_Median_Spend_Rate", "VPW — Median Spend Rate", is_pct=True),
+            build_percentile_row("VPW_Avg_Spend_Rate", "VPW — Average Spend Rate", is_pct=True),
+            build_percentile_row("VPW_Min_WD_Rate", "VPW — Min Withdrawal Rate", is_pct=True),
+            build_percentile_row("VPW_Max_WD_Rate", "VPW — Max Withdrawal Rate", is_pct=True),
+            build_percentile_row("VPW_Median_WD_Rate", "VPW — Median Withdrawal Rate", is_pct=True),
+            build_percentile_row("VPW_Avg_WD_Rate", "VPW — Average Withdrawal Rate", is_pct=True),
+            build_percentile_row("VPW_Pct_Below_Fixed", "VPW — Duration Below", is_pct=True),
+        ])
+
+    percentile_rows.append(build_percentile_row("Guardrail_Success", "Guardrails — Failure %", is_pct_flipped=True))
+    if has_fixed:
+        percentile_rows.append(build_percentile_row("Fixed_Success", "Fixed — Failure %", is_pct_flipped=True))
+    if has_cape:
+        percentile_rows.append(build_percentile_row("CAPE_Success", "CAPE — Failure %", is_pct_flipped=True))
+    if has_vpw:
+        percentile_rows.append(build_percentile_row("VPW_Success", "VPW — Failure %", is_pct_flipped=True))
+
+    has_tax_summary = "Lifetime_Tax_Rate" in results_df.columns or any(
+        f"{prefix}Lifetime_Tax_Rate" in results_df.columns
+        for prefix in ("Fixed_", "CAPE_", "VPW_")
+    )
+    if has_tax_summary:
+        st.markdown("**Historical Tax & ACA Efficiency Summary**")
+        st.caption(
+            "Percentiles use the same historical retirement ordering as the spend-rate table: "
+            "worst to best by duration below initial, then minimum spending."
+        )
+        tax_strategy_prefixes = [
+            ("", "Guardrails"),
+            ("Fixed_", "Fixed"),
+            ("CAPE_", "CAPE"),
+            ("VPW_", "VPW"),
+        ]
+        tax_summary_rows = []
+        for prefix, strategy_label in tax_strategy_prefixes:
+            for metric_key, metric_label, metric_kind in _HISTORICAL_TAX_METRICS:
+                col_name = f"{prefix}{metric_key}" if prefix else metric_key
+                row_label = f"{strategy_label} — {metric_label}"
+                tax_summary_rows.append(
+                    _build_historical_tax_percentile_row(
+                        sorted_df,
+                        results_df,
+                        col_name,
+                        row_label,
+                        metric_kind,
+                    )
+                )
+        st.table(pd.DataFrame(tax_summary_rows).set_index("Metric"))
+        if "Lifetime_Tax_Rate" in results_df.columns and "Pre65_Avg_Annual_Tax_Pct" not in results_df.columns:
+            st.caption(
+                "Re-run analysis to populate pre-65 average tax metrics and multi-strategy tax columns."
+            )
+        elif "Lifetime_Tax_Rate" in results_df.columns and not any(
+            f"{prefix}Lifetime_Tax_Rate" in results_df.columns
+            for prefix in ("Fixed_", "CAPE_", "VPW_")
+        ):
+            st.caption("Re-run analysis to populate Fixed, CAPE, and VPW tax metrics.")
  
     st.markdown("**Guardrail spend rate percentiles across historical retirements**")
     st.table(pd.DataFrame(percentile_rows).set_index("Metric"))

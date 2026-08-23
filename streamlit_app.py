@@ -12,6 +12,7 @@ import streamlit as st
 import controls
 import display
 import shiller_utils
+import tax_utils
 import utils
 from app_settings import CashflowSetting, ConditionalCashflowSetting, Settings
 
@@ -26,7 +27,7 @@ if st.runtime.exists():
     # Mode toggle (top, persistent)
     mode = st.radio(
         "Mode",
-        ["Simulation Mode", "Historical Mode", "Combo Mode", "Guidance Mode"],
+        ["Simulation Mode", "Taxable Simulation Mode", "Historical Mode", "Taxable Historical Mode", "Combo Mode", "Guidance Mode"],
         index=0,
         horizontal=True,
         key="app_mode",
@@ -34,10 +35,14 @@ if st.runtime.exists():
     )
     is_guidance = (mode == "Guidance Mode")
     is_historical = (mode == "Historical Mode")
+    is_taxable = (mode in ("Taxable Mode", "Taxable Historical Mode"))
+    is_taxable_simulation = (mode == "Taxable Simulation Mode")
+    is_tax_aware = is_taxable or is_taxable_simulation
+    is_historical_like = is_historical or is_taxable
     is_simulation = (mode == "Simulation Mode")
     is_combo = (mode == "Combo Mode")
-
     controls.initialize_display()
+    controls.init_initial_portfolio_value(mode)
 
     def _render_sidebar_label(text: str, color: Optional[str] = None) -> None:
         """Render styled sidebar helper text with optional highlighting."""
@@ -66,7 +71,7 @@ if st.runtime.exists():
     sim_start_key = "_simulation_retirement_start_date"
     controls.init_start_date_field(today_date, sim_start_key, start_date_key, start_date_default, mode, is_guidance)
 
-    if not is_historical and not is_combo:
+    if not is_historical_like and not is_combo:
         start_date = st.sidebar.date_input(
             "Retirement Start Date",
             min_value=datetime.date(1871, 1, 1),
@@ -83,11 +88,11 @@ if st.runtime.exists():
 
     if is_guidance:
         start_date = today_date
-    elif is_simulation:
+    elif is_simulation or is_taxable_simulation:
         start_date = controls.get_date_state(start_date_key, start_date_default)
         st.session_state[sim_start_key] = start_date
 
-    if is_historical or is_combo:
+    if is_historical_like or is_combo:
         retirement_duration_years = st.sidebar.number_input(
             "Retirement Duration (years)",
             value=controls.get_int_state("retirement_duration_years", 50),
@@ -128,7 +133,7 @@ if st.runtime.exists():
         retirement_duration_months = int(retirement_duration_years) * 12
         st.session_state["retirement_duration_months"] = retirement_duration_months
 
-        if is_simulation:
+        if is_simulation or is_taxable_simulation:
             notice_ph = st.sidebar.empty()
             shiller_df = st.session_state.get("shiller_df")
             if shiller_df is not None and not shiller_df.empty:
@@ -150,7 +155,7 @@ if st.runtime.exists():
             else:
                 notice_ph.empty()
 
-    if is_historical or is_combo:
+    if is_historical_like or is_combo:
         analysis_start_date = st.sidebar.date_input(
             "Historical Analysis Start Date",
             value=controls.get_date_state("analysis_start_date", datetime.date(1871, 1, 1)),
@@ -170,14 +175,74 @@ if st.runtime.exists():
             st.session_state["analysis_start_date"] = datetime.date(1871, 1, 1)
         analysis_start_date = st.session_state["analysis_start_date"]
 
-    # Numeric Inputs
-    initial_value = st.sidebar.number_input(
-        "Initial Portfolio Value",
-        min_value=100_000.0,
-        step=100_000.0,
-        key="initial_portfolio_value",
-        help="Starting portfolio balance in dollars at retirement."
-    )
+    # Portfolio inputs
+    if is_tax_aware:
+        controls.init_taxable_accounts_widget_state()
+        st.sidebar.markdown("**Starting Accounts**")
+        st.sidebar.caption(
+            "Each row is a holding. Edit the table, then select Apply account changes. Taxable bond returns are taxed as they occur; equity gains are taxed when sold."
+        )
+        edited_accounts_df = st.sidebar.data_editor(
+            st.session_state[controls.TAXABLE_ACCOUNTS_DRAFT_KEY],
+            column_config={
+                "account_type": st.column_config.SelectboxColumn(
+                    "Account Type",
+                    options=["taxable", "retirement pretax", "retirement post tax"],
+                    required=True,
+                ),
+                "asset_type": st.column_config.SelectboxColumn(
+                    "Asset Type", options=["equity", "bond"], required=True,
+                ),
+                "cost_basis": st.column_config.NumberColumn("Cost Basis", min_value=0.0, format="$%.0f"),
+                "total": st.column_config.NumberColumn("Total", min_value=0.0, format="$%.0f"),
+            },
+            num_rows="dynamic",
+            hide_index=True,
+        )
+        apply_account_changes = st.sidebar.button(
+            "Apply account changes",
+            key="apply_taxable_accounts_btn",
+        )
+        if apply_account_changes:
+            saved, message = controls.commit_taxable_accounts_from_editor(edited_accounts_df)
+            if saved:
+                st.sidebar.success(message)
+            else:
+                st.sidebar.error(message)
+                st.session_state[controls.TAXABLE_ACCOUNTS_DRAFT_KEY] = edited_accounts_df
+        else:
+            st.session_state[controls.TAXABLE_ACCOUNTS_DRAFT_KEY] = edited_accounts_df
+        taxable_accounts = st.session_state["taxable_mode_accounts"]
+        try:
+            normalized_accounts = tax_utils.normalize_accounts(taxable_accounts)
+        except ValueError as exc:
+            st.sidebar.error(str(exc))
+            normalized_accounts = []
+        initial_value = sum(account.total for account in normalized_accounts)
+        equity_value = sum(account.total for account in normalized_accounts if account.asset_type == "equity")
+        current_stock_pct = equity_value / initial_value if initial_value > 0 else 0.0
+        st.session_state["initial_portfolio_value"] = initial_value
+        st.sidebar.caption(
+            f"Portfolio total: ${initial_value:,.0f}  |  Current equity allocation: {current_stock_pct:.0%}"
+        )
+        marital_status = st.sidebar.selectbox(
+            "Marital Status", ["single", "mfj"], key="taxable_mode_marital_status",
+            format_func=lambda value: "Single" if value == "single" else "Married filing jointly",
+        )
+        current_age = st.sidebar.number_input(
+            "Current Age", min_value=0, max_value=120, value=42, step=1, key="taxable_mode_current_age",
+        )
+    else:
+        taxable_accounts = []
+        marital_status = None
+        current_age = None
+        initial_value = st.sidebar.number_input(
+            "Initial Portfolio Value",
+            min_value=100_000.0,
+            step=100_000.0,
+            key="initial_portfolio_value",
+            help="Starting portfolio balance in dollars at retirement."
+        )
 
     if is_combo:
         stock_pct_range = st.sidebar.slider(
@@ -191,10 +256,21 @@ if st.runtime.exists():
         )
         stock_pct_min, stock_pct_max = stock_pct_range
         stock_pct = (stock_pct_min + stock_pct_max) / 2.0
+    elif is_tax_aware:
+        stock_pct = st.sidebar.slider(
+            "Stock Percentage",
+            value=float(st.session_state.get("stock_pct", controls.DEFAULT_STOCK_PCT)),
+            min_value=0.0,
+            max_value=1.0,
+            step=0.05,
+            key="stock_pct",
+            help="Target equity allocation used for the retirement-only rebalance after each withdrawal. "
+                 "Taxable holdings are not traded during rebalancing.",
+        )
     else:
         stock_pct = st.sidebar.slider(
             "Stock Percentage",
-            value=controls.get_float_state("stock_pct", 0.90),
+            value=float(st.session_state.get("stock_pct", controls.DEFAULT_STOCK_PCT)),
             min_value=0.0,
             max_value=1.0,
             step=0.05,
@@ -236,7 +312,7 @@ if st.runtime.exists():
             'analysis_start_date': pd.to_datetime(analysis_start_date),
             'initial_value': float(initial_value),
             'stock_pct': float(stock_pct),
-            'desired_success_rate': float(st.session_state.get("target_success_rate", 0.80)),
+            'desired_success_rate': float(st.session_state.get("target_success_rate", 0.70)),
             'final_value_target': float(st.session_state.get('final_value_target', 0.0)),
             'final_value_target_ramp_down': bool(st.session_state.get('final_value_target_ramp_down', False)),
             'cashflows': controls.cashflows_to_tuple(sanitized_cashflows),
@@ -511,6 +587,7 @@ if st.runtime.exists():
                 "amount": 0.0,
                 "label": f"Cashflow {len(st.session_state['cashflows']) + 1}",
             })
+            controls.save_recurring_cashflows_to_csv(st.session_state["cashflows"])
             st.rerun()
 
         controls.draw_cashflow_widget_rows()
@@ -526,7 +603,7 @@ if st.runtime.exists():
 
         controls.draw_conditional_cashflow_widget_rows()
 
-    if is_historical or is_simulation or is_combo:
+    if is_historical_like or is_simulation or is_taxable_simulation or is_combo:
         _render_sidebar_label("Fixed Yearly Withdrawal %")
 
         st.sidebar.number_input(
@@ -548,6 +625,17 @@ if st.runtime.exists():
     else:
         fixed_monthly_withdrawal = None
         st.session_state["fixed_monthly_withdrawal"] = None
+
+    fixed_yearly_withdrawal_including_taxes = None
+    if is_taxable and fixed_monthly_withdrawal is not None and normalized_accounts:
+        fixed_funding = tax_utils.fund_spending_with_tax(
+            normalized_accounts,
+            float(fixed_monthly_withdrawal) * 12.0,
+            marital_status,
+            current_age=current_age,
+            target_stock_pct=stock_pct,
+        )
+        fixed_yearly_withdrawal_including_taxes = float(fixed_funding["gross_withdrawal"])
 
 
     # Build Settings object representing the full control state
@@ -576,17 +664,24 @@ if st.runtime.exists():
         lower_adjustment_fraction=float(lower_adjustment_fraction),
         adjustment_threshold=float(adjustment_threshold),
         adjustment_frequency=adjustment_frequency,
-        spending_cap_option=st.session_state.get("spending_cap_option", "Unlimited"),
-        spending_floor_option=st.session_state.get("spending_floor_option", "Unlimited"),
+        spending_cap_option=st.session_state.get(
+            "spending_cap_option", controls.DEFAULT_SPENDING_CAP_OPTION,
+        ),
+        spending_floor_option=st.session_state.get(
+            "spending_floor_option", controls.DEFAULT_SPENDING_FLOOR_OPTION,
+        ),
         shiller_extension_mode=st.session_state.get("shiller_extension_mode", shiller_utils.SHILLER_EXTENSION_MODE),
         final_value_target=float(st.session_state.get("final_value_target", 0.0)),
         final_value_target_ramp_down=bool(st.session_state.get("final_value_target_ramp_down", False)),
         fixed_monthly_withdrawal=fixed_monthly_withdrawal,
         historical_future_extension_years=(
-            int(historical_future_extension_years) if (is_historical or is_combo) else None
+            int(historical_future_extension_years) if (is_historical_like or is_combo) else None
         ),
         cashflows=cashflow_settings,
         conditional_cashflows=conditional_cashflow_settings,
+        accounts=list(taxable_accounts) if is_tax_aware else [],
+        marital_status=marital_status if is_tax_aware else "single",
+        current_age=float(current_age) if is_tax_aware and current_age is not None else None,
     )
 
     st.session_state["settings"] = settings
@@ -604,6 +699,14 @@ if st.runtime.exists():
     share_link_url = f"?config={encoded_config}"
 
     sim_signature = settings.simulation_signature()
+    if is_tax_aware:
+        sim_signature["taxable_accounts"] = tuple(
+            (account.account_type, account.asset_type, account.cost_basis, account.total)
+            for account in normalized_accounts
+        )
+        sim_signature["marital_status"] = marital_status
+        sim_signature["current_age"] = current_age
+        sim_signature["taxable_target_stock_pct"] = stock_pct
     last_run_signature = st.session_state.get('last_run_signature')
     dirty = last_run_signature is not None and last_run_signature != sim_signature
     st.session_state['dirty'] = dirty
@@ -636,9 +739,9 @@ if st.runtime.exists():
         except Exception as e:
             st.error(f"Unable to compute guidance snapshot: {e}")
 
-    elif is_historical:
+    elif is_historical_like:
         if st.sidebar.button(
-            "Run Historical Analysis",
+            "Run Taxable Analysis" if is_taxable else "Run Historical Analysis",
             help="Run the guardrail strategy for every historical retirement start year that fits in the Shiller dataset.",
         ):
             status_ph = st.empty()
@@ -646,11 +749,11 @@ if st.runtime.exists():
             shiller_df = shiller_utils.get_cached_shiller_df(st.session_state)
             status_ph.text("Shiller data loaded.")
 
-            progress = status_ph.progress(0, text="Running historical retirements... 0%")
+            progress = status_ph.progress(0, text=("Running taxable retirements... 0%" if is_taxable else "Running historical retirements... 0%"))
             state = {"pct": 0, "status": None}
 
             def render_historical_progress():
-                label = f"Running historical retirements... {state['pct']}%"
+                label = f"Running {'taxable' if is_taxable else 'historical'} retirements... {state['pct']}%"
                 if state["status"]:
                     label = f"{label} — {state['status']}"
                 progress.progress(state["pct"], text=label)
@@ -666,7 +769,7 @@ if st.runtime.exists():
 
             try:
                 run_started_at = perf_counter()
-                historical_results_df = utils.run_historical_retirements_analysis(
+                historical_results_df = (tax_utils if is_taxable else utils).run_historical_retirements_analysis(
                     df=shiller_df,
                     settings=settings,
                     on_progress=on_historical_progress,
@@ -682,6 +785,7 @@ if st.runtime.exists():
                     historical_results_df,
                     calculation_time_seconds=historical_elapsed_seconds,
                     fixed_monthly_withdrawal=fixed_monthly_withdrawal,
+                    fixed_yearly_withdrawal_including_taxes=fixed_yearly_withdrawal_including_taxes,
                 )
             except Exception as e:
                 status_ph.empty()
@@ -695,16 +799,18 @@ if st.runtime.exists():
                 st.session_state["historical_results_df"],
                 calculation_time_seconds=st.session_state.get("historical_elapsed_seconds"),
                 fixed_monthly_withdrawal=fixed_monthly_withdrawal,
+                fixed_yearly_withdrawal_including_taxes=fixed_yearly_withdrawal_including_taxes,
             )
         else:
-            st.subheader("Historical Mode")
+            st.subheader("Taxable Historical Mode" if is_taxable else "Historical Mode")
             st.markdown(
-                "Use this mode to run the guardrail withdrawal strategy across every historical retirement start year "
-                "for a fixed duration.\n\n"
+                ("Use this mode to run the tax-aware guardrail withdrawal strategy across every historical retirement start year "
+                 if is_taxable else "Use this mode to run the guardrail withdrawal strategy across every historical retirement start year ")
+                + "for a fixed duration.\n\n"
                 "All dollar amounts shown are in real (constant) dollars, net of inflation. For more details, see the "
                 "[documentation](https://github.com/asurkhain/fire-guardrails/blob/main/README.md)."
             )
-            st.info("Adjust parameters in the sidebar and click 'Run Historical Analysis' to start.")
+            st.info(f"Adjust parameters in the sidebar and click 'Run {'Taxable' if is_taxable else 'Historical'} Analysis' to start.")
 
     elif is_combo:
         if st.sidebar.button(
@@ -841,6 +947,54 @@ if st.runtime.exists():
             else:
                 st.caption("No saved combo results found.")
             st.info("Adjust parameters in the sidebar and click 'Run Combo Analysis' to start.")
+
+    elif is_taxable_simulation and st.sidebar.button(
+        "Run Taxable Simulation",
+        help="Run the guardrail simulation with account-level tax diagnostics.",
+    ):
+        status_ph = st.empty()
+        status_ph.text("Loading Shiller data...")
+        shiller_df = shiller_utils.get_cached_shiller_df(st.session_state)
+        status_ph.text("Calculating taxable simulation...")
+        base_results = tax_utils.get_guardrail_withdrawals(
+            df=shiller_df,
+            settings=settings,
+            verbose=True,
+        )
+        taxable_results_df = tax_utils.add_tax_metrics_to_withdrawal_results(
+            base_results,
+            normalized_accounts,
+            marital_status,
+            current_age,
+            target_stock_pct=stock_pct,
+            market_data=shiller_df,
+        )
+        st.session_state["taxable_simulation_results_df"] = taxable_results_df
+        st.session_state["last_run_signature"] = sim_signature
+        st.session_state["dirty"] = False
+        status_ph.empty()
+        display.render_simulation_results(
+            taxable_results_df,
+            fixed_monthly_withdrawal=fixed_monthly_withdrawal,
+            current_age=current_age,
+        )
+
+    elif is_taxable_simulation:
+        if "taxable_simulation_results_df" in st.session_state:
+            if st.session_state.get("dirty"):
+                controls.render_dirty_banner()
+            display.render_simulation_results(
+                st.session_state["taxable_simulation_results_df"],
+                fixed_monthly_withdrawal=fixed_monthly_withdrawal,
+                current_age=current_age,
+            )
+        else:
+            st.subheader("Taxable Simulation Mode")
+            st.markdown(
+                "Use this mode to run a guardrail simulation with account-based tax withdrawals. "
+                "The Tax Rate Over Time chart reports taxes paid divided by the tax-inclusive withdrawal."
+            )
+            st.info("Adjust parameters in the sidebar and click 'Run Taxable Simulation' to start.")
 
     elif is_simulation and st.sidebar.button(
         "Run Simulation",

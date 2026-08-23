@@ -2,6 +2,7 @@ import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Iterable, Mapping
 
 from joblib import dump, load
 
@@ -14,6 +15,941 @@ from cape_utils import calculate_cape_withdrawal_rate, simulate_cape_withdrawal_
 from vpw_utils import _apply_vpw_comparison_step, simulate_vpw_withdrawal_retirement
 from shiller_utils import *  # noqa: F401,F403
 
+
+# 2026 federal brackets supplied for the tax-mode calculation.  Thresholds are
+# the lower edge of each bracket, which makes them convenient for progressive
+# tax calculations.
+ORDINARY_INCOME_BRACKETS = {
+    "single": ((0.0, 0.10), (12_400.0, 0.12), (50_400.0, 0.22),
+               (105_700.0, 0.24), (201_775.0, 0.32), (256_225.0, 0.35),
+               (640_600.0, 0.37)),
+    "mfj": ((0.0, 0.10), (24_800.0, 0.12), (100_800.0, 0.22),
+            (211_400.0, 0.24), (403_550.0, 0.32), (512_450.0, 0.35),
+            (768_700.0, 0.37)),
+}
+STANDARD_DEDUCTIONS = {"single": 16_100.0, "mfj": 32_200.0}
+NIIT_THRESHOLDS = {"single": 200_000.0, "mfj": 250_000.0}
+NIIT_RATE = 0.038
+FPL_400_THRESHOLDS = {"single": 63_840.0, "mfj": 86_560.0}
+LTCG_BRACKETS = {
+    "single": ((0.0, 0.00), (49_450.0, 0.15), (545_500.0, 0.20)),
+    "mfj": ((0.0, 0.00), (98_900.0, 0.15), (613_700.0, 0.20)),
+}
+
+
+@dataclass
+class PortfolioAccount:
+    """A tax-mode account balance.
+
+    ``total`` is the current market value. ``cost_basis`` is used for taxable
+    accounts and for the basis-first phase of post-tax retirement accounts.
+    """
+
+    account_type: str
+    asset_type: str
+    cost_basis: float
+    total: float
+    account_id: str = ""
+
+
+def _canonical_marital_status(marital_status: str) -> str:
+    value = str(marital_status).strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {"single": "single", "s": "single", "mfj": "mfj", "married_filing_jointly": "mfj"}
+    if value not in aliases:
+        raise ValueError("Marital status must be 'single' or 'mfj'.")
+    return aliases[value]
+
+
+def _canonical_account_type(account_type: str) -> str:
+    value = str(account_type).strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "taxable": "taxable",
+        "retirement_pretax": "retirement_pretax",
+        "pretax": "retirement_pretax",
+        "pre_tax": "retirement_pretax",
+        "traditional": "retirement_pretax",
+        "retirement_post_tax": "retirement_post_tax",
+        "posttax": "retirement_post_tax",
+        "post_tax": "retirement_post_tax",
+        "roth": "retirement_post_tax",
+    }
+    if value not in aliases:
+        raise ValueError("Account type must be taxable, retirement pretax, or retirement post tax.")
+    return aliases[value]
+
+
+def _canonical_asset_type(asset_type: str) -> str:
+    value = str(asset_type).strip().lower()
+    if value not in ("equity", "bond"):
+        raise ValueError("Asset type must be equity or bond.")
+    return value
+
+
+def normalize_accounts(accounts: Iterable[PortfolioAccount | Mapping[str, Any]]) -> list[PortfolioAccount]:
+    """Validate and copy account input into the internal account representation."""
+
+    normalized: list[PortfolioAccount] = []
+    for index, raw_account in enumerate(accounts):
+        if isinstance(raw_account, PortfolioAccount):
+            raw_account = raw_account.__dict__
+        if not isinstance(raw_account, Mapping):
+            raise ValueError(f"Account {index + 1} must be an account object.")
+        try:
+            account = PortfolioAccount(
+                account_type=_canonical_account_type(raw_account["account_type"]),
+                asset_type=_canonical_asset_type(raw_account["asset_type"]),
+                cost_basis=float(raw_account["cost_basis"]),
+                total=float(raw_account["total"]),
+                account_id=str(raw_account.get("account_id", raw_account.get("id", index))),
+            )
+        except KeyError as exc:
+            raise ValueError(f"Account {index + 1} is missing required field {exc.args[0]!r}.") from exc
+        if not np.isfinite(account.total) or account.total < 0.0:
+            raise ValueError(f"Account {index + 1} total must be a non-negative finite number.")
+        if not np.isfinite(account.cost_basis) or account.cost_basis < 0.0:
+            raise ValueError(f"Account {index + 1} cost basis must be a non-negative finite number.")
+        normalized.append(account)
+    return normalized
+
+
+def _taxable_account_balance(accounts: Iterable[PortfolioAccount]) -> float:
+    """Return the total balance across all taxable accounts."""
+
+    return sum(
+        float(account.total)
+        for account in accounts
+        if account.account_type == "taxable"
+    )
+
+
+def settle_taxable_bond_gains(
+    accounts: Iterable[PortfolioAccount | Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Recognize accrued taxable-bond gains now and add them to cost basis.
+
+    This is the tax mode's simplified bond rule: positive return in a taxable
+    bond account is ordinary investment income in the period it occurs, rather
+    than income deferred until the account is sold.  The recognized gain is
+    added to basis, preventing the same return from being taxed again later.
+    """
+
+    working_accounts = normalize_accounts(accounts)
+    ordinary_income = 0.0
+    settlements: list[dict[str, float | str]] = []
+    for account in working_accounts:
+        if account.account_type != "taxable" or account.asset_type != "bond":
+            continue
+        gain = max(0.0, account.total - account.cost_basis)
+        if gain > 0.0:
+            account.cost_basis += gain
+            ordinary_income += gain
+            settlements.append({
+                "account_id": account.account_id,
+                "account_type": account.account_type,
+                "asset_type": account.asset_type,
+                "amount": gain,
+                "ordinary_income": gain,
+            })
+    return {
+        "accounts": working_accounts,
+        "taxable_bond_income": ordinary_income,
+        "settlements": settlements,
+    }
+
+
+def apply_account_return_multipliers(
+    accounts: Iterable[PortfolioAccount | Mapping[str, Any]],
+    equity_return_multiplier: float,
+    bond_return_multiplier: float,
+) -> dict[str, Any]:
+    """Apply one period's market returns and recognize taxable-bond income.
+
+    Return values are multipliers, matching :func:`compute_portfolio_returns`:
+    ``1.05`` represents a 5% return. Taxable bond appreciation is settled
+    immediately; equity gains remain unrealized until withdrawal.
+    """
+
+    equity_multiplier = max(0.0, float(equity_return_multiplier))
+    bond_multiplier = max(0.0, float(bond_return_multiplier))
+    updated_accounts = normalize_accounts(accounts)
+    for account in updated_accounts:
+        multiplier = equity_multiplier if account.asset_type == "equity" else bond_multiplier
+        account.total *= multiplier
+    return settle_taxable_bond_gains(updated_accounts)
+
+
+def rebalance_retirement_accounts(
+    accounts: Iterable[PortfolioAccount | Mapping[str, Any]], target_stock_pct: float
+) -> dict[str, Any]:
+    """Best-effort rebalance retirement holdings while leaving taxable accounts intact.
+
+    When more bonds are needed, pre-tax equity is converted to bonds before
+    post-tax equity. When more equity is needed, post-tax bonds are converted
+    first. A partial conversion creates (or adds to) the matching holding in
+    the same account type; no taxable-account trades are made.
+    """
+
+    target_stock_pct = float(target_stock_pct)
+    if not 0.0 <= target_stock_pct <= 1.0:
+        raise ValueError("Target stock percentage must be between 0 and 1.")
+    working_accounts = normalize_accounts(accounts)
+    total_value = sum(account.total for account in working_accounts)
+    current_equity = sum(account.total for account in working_accounts if account.asset_type == "equity")
+    target_equity = total_value * target_stock_pct
+    amount_to_reclassify = abs(target_equity - current_equity)
+    target_asset = "equity" if target_equity > current_equity else "bond"
+
+    if amount_to_reclassify <= 1e-9:
+        return {
+            "accounts": working_accounts,
+            "rebalanced_amount": 0.0,
+            "target_stock_pct": target_stock_pct,
+            "achieved_stock_pct": current_equity / total_value if total_value else 0.0,
+            "transactions": [],
+        }
+
+    source_asset = "bond" if target_asset == "equity" else "equity"
+    # Required priority: bonds go to pre-tax first; equity goes to post-tax first.
+    account_priority = (
+        ("retirement_post_tax", "retirement_pretax")
+        if target_asset == "equity"
+        else ("retirement_pretax", "retirement_post_tax")
+    )
+    transactions: list[dict[str, float | str]] = []
+
+    def add_destination(account_type: str, account_id: str, amount: float, basis: float) -> None:
+        for account in working_accounts:
+            if (
+                account.account_type == account_type
+                and account.account_id == account_id
+                and account.asset_type == target_asset
+            ):
+                account.total += amount
+                account.cost_basis += basis
+                return
+        working_accounts.append(PortfolioAccount(
+            account_type=account_type,
+            asset_type=target_asset,
+            cost_basis=basis,
+            total=amount,
+            account_id=account_id,
+        ))
+
+    remaining = amount_to_reclassify
+    for account_type in account_priority:
+        for source in list(working_accounts):
+            if remaining <= 1e-9:
+                break
+            if source.account_type != account_type or source.asset_type != source_asset or source.total <= 0.0:
+                continue
+            amount = min(remaining, source.total)
+            basis_transfer = source.cost_basis * amount / source.total
+            source.total -= amount
+            source.cost_basis = max(0.0, source.cost_basis - basis_transfer)
+            add_destination(account_type, source.account_id, amount, basis_transfer)
+            transactions.append({
+                "account_id": source.account_id,
+                "account_type": account_type,
+                "from_asset_type": source_asset,
+                "to_asset_type": target_asset,
+                "amount": amount,
+            })
+            remaining -= amount
+        if remaining <= 1e-9:
+            break
+
+    working_accounts = [account for account in working_accounts if account.total > 1e-9]
+    achieved_equity = sum(account.total for account in working_accounts if account.asset_type == "equity")
+    return {
+        "accounts": working_accounts,
+        "rebalanced_amount": amount_to_reclassify - remaining,
+        "target_stock_pct": target_stock_pct,
+        "achieved_stock_pct": achieved_equity / total_value if total_value else 0.0,
+        "transactions": transactions,
+    }
+
+
+def _progressive_tax(income: float, brackets: tuple[tuple[float, float], ...]) -> float:
+    income = max(0.0, float(income))
+    tax = 0.0
+    for index, (lower, rate) in enumerate(brackets):
+        upper = brackets[index + 1][0] if index + 1 < len(brackets) else np.inf
+        tax += max(0.0, min(income, upper) - lower) * rate
+    return tax
+
+
+def calculate_fpl_health_expense(total_income: float, marital_status: str, age: float | None) -> float:
+    """Return the annual under-65 health expense triggered above 400% FPL.
+
+    The supplied values define a linear age curve from $8,000 at age 42 to
+    $21,140 at age 64. Ages outside that range use the nearest endpoint, which
+    avoids extrapolating an implausible expense for younger retirees.
+    """
+
+    if age is None or float(age) >= 65.0:
+        return 0.0
+    status = _canonical_marital_status(marital_status)
+    if float(total_income) <= FPL_400_THRESHOLDS[status]:
+        return 0.0
+    bounded_age = min(64.0, max(42.0, float(age)))
+    individual_expense = 8_000.0 + (bounded_age - 42.0) * (21_140.0 - 8_000.0) / (64.0 - 42.0)
+    return individual_expense * (2.0 if status == "mfj" else 1.0)
+
+
+def calculate_federal_income_tax(
+    ordinary_income: float,
+    long_term_capital_gains: float,
+    marital_status: str,
+    net_investment_income: float | None = None,
+    age: float | None = None,
+) -> dict[str, float]:
+    """Calculate federal income tax after the standard deduction.
+
+    Long-term gains are stacked above taxable ordinary income, as required by
+    the supplied LTCG brackets. NIIT is 3.8% of the lesser of net investment
+    income and MAGI above the status-specific NIIT threshold.  This model uses
+    ordinary income plus long-term gains as MAGI, without rare MAGI adjustments.
+    """
+
+    status = _canonical_marital_status(marital_status)
+    ordinary = max(0.0, float(ordinary_income))
+    gains = max(0.0, float(long_term_capital_gains))
+    # Long-term capital gains are investment income by definition here.  Callers
+    # can supply bond interest/gains or other investment income explicitly.
+    investment_income = gains if net_investment_income is None else max(0.0, float(net_investment_income))
+    deduction = STANDARD_DEDUCTIONS[status]
+    taxable_ordinary = max(ordinary - deduction, 0.0)
+    deduction_left = max(deduction - ordinary, 0.0)
+    taxable_gains = max(gains - deduction_left, 0.0)
+    ordinary_tax = _progressive_tax(taxable_ordinary, ORDINARY_INCOME_BRACKETS[status])
+
+    # LTCG brackets apply to total taxable income.  Tax only the incremental
+    # gains, starting at the taxable ordinary-income level.
+    gains_tax = (
+        _progressive_tax(taxable_ordinary + taxable_gains, LTCG_BRACKETS[status])
+        - _progressive_tax(taxable_ordinary, LTCG_BRACKETS[status])
+    )
+    modified_adjusted_gross_income = ordinary + gains
+    niit_threshold = NIIT_THRESHOLDS[status]
+    niit_taxable_income = min(
+        investment_income,
+        max(0.0, modified_adjusted_gross_income - niit_threshold),
+    )
+    niit = niit_taxable_income * NIIT_RATE
+    fpl_health_expense = calculate_fpl_health_expense(modified_adjusted_gross_income, status, age)
+    return {
+        "ordinary_income": ordinary,
+        "long_term_capital_gains": gains,
+        "standard_deduction": deduction,
+        "taxable_ordinary_income": taxable_ordinary,
+        "taxable_long_term_capital_gains": taxable_gains,
+        "ordinary_income_tax": ordinary_tax,
+        "long_term_capital_gains_tax": gains_tax,
+        "net_investment_income": investment_income,
+        "modified_adjusted_gross_income": modified_adjusted_gross_income,
+        "niit_threshold": niit_threshold,
+        "niit_taxable_income": niit_taxable_income,
+        "net_investment_income_tax": niit,
+        "fpl_health_expense": fpl_health_expense,
+        "total_tax": ordinary_tax + gains_tax + niit,
+        "total_tax_and_fpl_health_expense": ordinary_tax + gains_tax + niit + fpl_health_expense,
+    }
+
+
+def _withdraw_from_account(account: PortfolioAccount, amount: float, phase: str) -> dict[str, float | str]:
+    """Withdraw an amount from one account, returning its taxable character."""
+
+    amount = min(max(float(amount), 0.0), account.total)
+    if amount <= 0.0:
+        return {}
+    gain = max(account.total - account.cost_basis, 0.0)
+    ordinary_income = 0.0
+    long_term_capital_gains = 0.0
+    if account.account_type == "taxable" and account.total > 0.0:
+        if account.asset_type == "equity":
+            realized_gain = amount * gain / account.total
+            long_term_capital_gains = realized_gain
+            account.cost_basis = max(0.0, account.cost_basis - (amount - realized_gain))
+        else:
+            # Taxable bond returns are settled as ordinary investment income as
+            # they arise and added to basis, so a later withdrawal is principal.
+            account.cost_basis = max(0.0, account.cost_basis - amount)
+    elif account.account_type == "retirement_pretax":
+        ordinary_income = amount
+        # Cost basis does not affect tax treatment of a pre-tax account.
+        account.cost_basis = max(0.0, account.cost_basis - min(account.cost_basis, amount))
+    else:  # post-tax retirement distributions are tax-free
+        if phase == "post_tax_basis":
+            account.cost_basis = max(0.0, account.cost_basis - amount)
+    account.total = max(0.0, account.total - amount)
+    return {
+        "account_id": account.account_id,
+        "account_type": account.account_type,
+        "asset_type": account.asset_type,
+        "phase": phase,
+        "amount": amount,
+        "ordinary_income": ordinary_income,
+        "long_term_capital_gains": long_term_capital_gains,
+    }
+
+
+def allocate_account_withdrawal(
+    accounts: Iterable[PortfolioAccount | Mapping[str, Any]],
+    gross_withdrawal: float,
+    fpl_income_limit: float | None = None,
+) -> dict[str, Any]:
+    """Allocate a gross withdrawal using the tax-mode account order.
+
+    Taxable accounts are drawn as newly recognized bond-return cash, equity
+    sales up to ``fpl_income_limit``, then taxable-bond basis. The retirement
+    order is post-tax basis, pre-tax, then post-tax growth. The returned
+    accounts are copies, leaving the caller's input unchanged.
+    """
+
+    remaining = max(0.0, float(gross_withdrawal))
+    bond_settlement = settle_taxable_bond_gains(accounts)
+    working_accounts = bond_settlement["accounts"]
+    transactions: list[dict[str, float | str]] = []
+    settled_bond_gains = {
+        str(item["account_id"]): float(item["amount"])
+        for item in bond_settlement["settlements"]
+    }
+    remaining_fpl_income = (
+        np.inf if fpl_income_limit is None else max(0.0, float(fpl_income_limit))
+    )
+    remaining_fpl_income = max(
+        0.0, remaining_fpl_income - float(bond_settlement["taxable_bond_income"])
+    )
+
+    # The just-recognized taxable bond return is used first. Its income was
+    # recorded by the settlement step, so this cash withdrawal has no new tax.
+    for account in working_accounts:
+        if remaining <= 1e-9:
+            break
+        if account.account_type == "taxable" and account.asset_type == "bond":
+            bond_gain_cash = settled_bond_gains.get(account.account_id, 0.0)
+            transaction = _withdraw_from_account(account, min(remaining, bond_gain_cash), "taxable_bond_gain")
+            if transaction:
+                transactions.append(transaction)
+                remaining -= float(transaction["amount"])
+
+    # Realize equity gains only until the income room below 400% FPL is used.
+    for account in working_accounts:
+        if remaining <= 1e-9 or remaining_fpl_income <= 1e-9:
+            break
+        if account.account_type != "taxable" or account.asset_type != "equity" or account.total <= 0.0:
+            continue
+        gain_ratio = max(account.total - account.cost_basis, 0.0) / account.total
+        maximum_equity_draw = account.total if gain_ratio <= 0.0 else remaining_fpl_income / gain_ratio
+        transaction = _withdraw_from_account(
+            account,
+            min(remaining, maximum_equity_draw, account.total),
+            "taxable_equity_to_fpl_limit",
+        )
+        if transaction:
+            transactions.append(transaction)
+            remaining -= float(transaction["amount"])
+            remaining_fpl_income = max(
+                0.0, remaining_fpl_income - float(transaction["long_term_capital_gains"])
+            )
+
+    # Check if drawing taxable bond basis will allow staying under the FPL cap.
+    # If an FPL limit is in effect and remaining withdrawal exceeds available taxable bond basis,
+    # then drawing bond basis will not prevent exceeding FPL (since subsequent equity/pretax draws
+    # will push income over FPL anyway). In that case, preserve bond basis and draw taxable equity first.
+    available_taxable_bond_basis = sum(
+        account.total for account in working_accounts
+        if account.account_type == "taxable" and account.asset_type == "bond"
+    )
+
+    can_stay_under_fpl_with_bond_basis = (
+        fpl_income_limit is None
+        or fpl_income_limit == np.inf
+        or remaining <= available_taxable_bond_basis + 1e-9
+    )
+
+    if can_stay_under_fpl_with_bond_basis:
+        for account in working_accounts:
+            if remaining <= 1e-9:
+                break
+            if account.account_type == "taxable" and account.asset_type == "bond" and account.total > 0:
+                transaction = _withdraw_from_account(account, min(remaining, account.total), "taxable_bond_basis")
+                if transaction:
+                    transactions.append(transaction)
+                    remaining -= float(transaction["amount"])
+
+    # The FPL target is a preference, not a spending cap. If the lower-income
+    # sources are exhausted (or cannot prevent crossing FPL), equity sales continue to fund the withdrawal.
+    for account in working_accounts:
+        if remaining <= 1e-9:
+            break
+        if account.account_type == "taxable" and account.asset_type == "equity":
+            transaction = _withdraw_from_account(account, min(remaining, account.total), "taxable_equity_after_fpl_limit")
+            if transaction:
+                transactions.append(transaction)
+                remaining -= float(transaction["amount"])
+
+    # If bond basis was deferred because it couldn't keep us under FPL, but taxable equity
+    # is now exhausted and we still have remaining withdrawal before retirement accounts:
+    if not can_stay_under_fpl_with_bond_basis:
+        for account in working_accounts:
+            if remaining <= 1e-9:
+                break
+            if account.account_type == "taxable" and account.asset_type == "bond" and account.total > 0:
+                transaction = _withdraw_from_account(account, min(remaining, account.total), "taxable_bond_basis")
+                if transaction:
+                    transactions.append(transaction)
+                    remaining -= float(transaction["amount"])
+
+    retirement_phases = (
+        ("post_tax_basis", lambda account: account.account_type == "retirement_post_tax", lambda account: min(account.cost_basis, account.total)),
+        ("pretax", lambda account: account.account_type == "retirement_pretax", lambda account: account.total),
+        ("post_tax_growth", lambda account: account.account_type == "retirement_post_tax", lambda account: max(account.total - account.cost_basis, 0.0)),
+    )
+    for phase, eligible, available in retirement_phases:
+        for account in working_accounts:
+            if remaining <= 1e-9:
+                break
+            if eligible(account):
+                transaction = _withdraw_from_account(account, min(remaining, available(account)), phase)
+                if transaction:
+                    transactions.append(transaction)
+                    remaining -= float(transaction["amount"])
+        if remaining <= 1e-9:
+            break
+
+    withdrawal_ordinary_income = sum(float(item["ordinary_income"]) for item in transactions)
+    ordinary_income = float(bond_settlement["taxable_bond_income"]) + withdrawal_ordinary_income
+    gains = sum(float(item["long_term_capital_gains"]) for item in transactions)
+    withdrawn = max(0.0, float(gross_withdrawal) - remaining)
+    return {
+        "accounts": working_accounts,
+        "transactions": transactions,
+        "gross_withdrawal": withdrawn,
+        "ordinary_income": ordinary_income,
+        "taxable_bond_income": float(bond_settlement["taxable_bond_income"]),
+        "taxable_bond_settlements": bond_settlement["settlements"],
+        "long_term_capital_gains": gains,
+        "unfunded_withdrawal": remaining,
+    }
+
+
+def fund_spending_with_tax(
+    accounts: Iterable[PortfolioAccount | Mapping[str, Any]],
+    spending: float,
+    marital_status: str,
+    other_ordinary_income: float = 0.0,
+    other_long_term_capital_gains: float = 0.0,
+    other_net_investment_income: float = 0.0,
+    current_age: float | None = None,
+    target_stock_pct: float | None = None,
+) -> dict[str, Any]:
+    """Determine the account draw needed to deliver ``spending`` after tax.
+
+    The method solves for the smallest gross draw under the required account
+    order.  It returns updated account copies, detailed withdrawals, federal
+    tax (including NIIT), FPL-triggered health expense, and any spending
+    shortfall if the portfolio is exhausted. ``other_net_investment_income``
+    covers investment income that is not represented by account withdrawals.
+    """
+
+    target = max(0.0, float(spending))
+    status = _canonical_marital_status(marital_status)
+    base_ordinary = max(0.0, float(other_ordinary_income))
+    base_gains = max(0.0, float(other_long_term_capital_gains))
+    base_investment_income = max(0.0, float(other_net_investment_income)) + base_gains
+    source_accounts = normalize_accounts(accounts)
+    maximum_draw = sum(account.total for account in source_accounts)
+    fpl_income_limit = None
+    if current_age is not None and float(current_age) < 65.0:
+        fpl_income_limit = max(
+            0.0,
+            FPL_400_THRESHOLDS[status] - base_ordinary - base_gains,
+        )
+
+    def result_for(draw: float) -> dict[str, Any]:
+        allocation = allocate_account_withdrawal(
+            source_accounts,
+            draw,
+            fpl_income_limit=fpl_income_limit,
+        )
+        tax = calculate_federal_income_tax(
+            base_ordinary + allocation["ordinary_income"],
+            base_gains + allocation["long_term_capital_gains"],
+            status,
+            net_investment_income=(
+                base_investment_income
+                + allocation["taxable_bond_income"]
+                + allocation["long_term_capital_gains"]
+            ),
+            age=current_age,
+        )
+        allocation["tax"] = tax
+        allocation["after_tax_cash_before_fpl_health_expense"] = allocation["gross_withdrawal"] - tax["total_tax"]
+        allocation["after_tax_cash"] = (
+            allocation["after_tax_cash_before_fpl_health_expense"] - tax["fpl_health_expense"]
+        )
+        return allocation
+
+    maximum_result = result_for(maximum_draw)
+    if maximum_result["after_tax_cash"] < target:
+        result = maximum_result
+    else:
+        # The FPL expense is a one-time step up. First see if spending can be
+        # funded below the threshold, where the normal bisection is monotonic.
+        low, high = 0.0, maximum_draw
+        for _ in range(80):
+            midpoint = (low + high) / 2.0
+            if result_for(midpoint)["after_tax_cash_before_fpl_health_expense"] >= target:
+                high = midpoint
+            else:
+                low = midpoint
+        no_expense_candidate = result_for(high)
+        if no_expense_candidate["tax"]["fpl_health_expense"] == 0.0:
+            result = no_expense_candidate
+        else:
+            # The no-expense solution is above the FPL threshold, so every
+            # feasible solution must fund the health expense as well.
+            low, high = 0.0, maximum_draw
+            for _ in range(80):
+                midpoint = (low + high) / 2.0
+                if result_for(midpoint)["after_tax_cash"] >= target:
+                    high = midpoint
+                else:
+                    low = midpoint
+            result = result_for(high)
+
+    result["requested_spending"] = target
+    result["funded_spending"] = min(target, max(0.0, result["after_tax_cash"]))
+    result["spending_shortfall"] = max(0.0, target - result["funded_spending"])
+    if target_stock_pct is not None:
+        rebalancing = rebalance_retirement_accounts(result["accounts"], target_stock_pct)
+        result["accounts"] = rebalancing["accounts"]
+        result["rebalancing"] = rebalancing
+    return result
+
+
+def add_tax_metrics_to_withdrawal_results(
+    results_df: pd.DataFrame,
+    accounts: Iterable[PortfolioAccount | Mapping[str, Any]],
+    marital_status: str,
+    current_age: float | None,
+    target_stock_pct: float | None = None,
+    market_data: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """Attach tax-inclusive draw and tax-rate diagnostics to a simulation path.
+
+    The guardrail engine supplies the monthly net cash need. This helper funds
+    it from the configured accounts in sequence and records the resulting tax
+    and gross draw, allowing tax-aware simulation charts without changing the
+    established guardrail controls.
+    """
+
+    enriched = results_df.copy()
+    if enriched.empty:
+        return enriched
+
+    dates = pd.to_datetime(enriched["Date"])
+    start_date = dates.iloc[0]
+    end_date = dates.iloc[-1]
+
+    # Pre-calculate monthly market returns if market_data is provided
+    stock_returns: np.ndarray = np.ones(len(enriched))
+    bond_returns: np.ndarray = np.ones(len(enriched))
+    if market_data is not None and not market_data.empty:
+        m_df = market_data.copy()
+        m_df["Date"] = pd.to_datetime(m_df["Date"])
+        merged = pd.merge(
+            enriched[["Date"]].copy(),
+            m_df[["Date", "Real Total Return Price", "Real Total Bond Returns"]],
+            on="Date",
+            how="left"
+        )
+        s_prices = merged["Real Total Return Price"].ffill().bfill().to_numpy(dtype=float)
+        b_prices = merged["Real Total Bond Returns"].ffill().bfill().to_numpy(dtype=float)
+        if len(s_prices) > 1:
+            stock_returns[:-1] = np.where(s_prices[:-1] > 0.0, s_prices[1:] / s_prices[:-1], 1.0)
+            bond_returns[:-1] = np.where(b_prices[:-1] > 0.0, b_prices[1:] / b_prices[:-1], 1.0)
+
+    strategies = (
+        ("", "Withdrawal", "Total_Spending"),
+        ("Fixed_", "Fixed_SR_Withdrawal", "Fixed_SR_Total_Spending"),
+        ("CAPE_", "CAPE_Withdrawal", "CAPE_Total_Spending"),
+        ("VPW_", "VPW_Withdrawal", "VPW_Total_Spending"),
+    )
+
+    for prefix, withdrawal_column, spending_column in strategies:
+        if withdrawal_column not in enriched.columns:
+            continue
+        working_accounts = normalize_accounts(accounts)
+        taxes: list[float] = []
+        aca_surcharges: list[float] = []
+        gross_draws: list[float] = []
+        tax_rates: list[float] = []
+        taxable_balances: list[float] | None = [] if prefix == "" else None
+        track_taxable_balances = (
+            prefix == ""
+            and _taxable_account_balance(working_accounts) > 1e-9
+        )
+        if spending_column in enriched.columns:
+            cashflow = pd.to_numeric(enriched.get("Net_Cashflow", 0.0), errors="coerce").fillna(0.0)
+            spending_needs = (pd.to_numeric(enriched[spending_column], errors="coerce").fillna(0.0) - cashflow).clip(lower=0.0)
+        else:
+            cashflow = pd.Series(0.0, index=enriched.index)
+            spending_needs = pd.to_numeric(enriched[withdrawal_column], errors="coerce").fillna(0.0)
+
+        working_df = pd.DataFrame({
+            "Date": dates,
+            "_spending": spending_needs,
+            "_cashflow": cashflow,
+            "_orig_idx": np.arange(len(enriched)),
+        })
+        working_df["_year"] = working_df["Date"].dt.year
+        start_year = int(working_df["_year"].iloc[0])
+
+        for year, year_group in working_df.groupby("_year", sort=False):
+            num_months_in_year = len(year_group)
+            year_spending_total = float(year_group["_spending"].sum())
+            year_cashflow_total = float(year_group["_cashflow"].sum())
+            sim_age = None if current_age is None else float(current_age) + (int(year) - start_year)
+
+            funding = fund_spending_with_tax(
+                working_accounts,
+                year_spending_total,
+                marital_status,
+                other_ordinary_income=year_cashflow_total,
+                current_age=sim_age,
+                target_stock_pct=target_stock_pct,
+            )
+
+            annual_tax = float(funding["tax"]["total_tax_and_fpl_health_expense"])
+            annual_aca = float(funding["tax"]["fpl_health_expense"])
+            annual_gross_draw = float(funding["gross_withdrawal"])
+            shortfall = float(funding.get("spending_shortfall", 0.0))
+
+            if shortfall > 1e-6:
+                base_ord = float(funding["tax"]["modified_adjusted_gross_income"])
+                status = _canonical_marital_status(marital_status)
+                low_sf, high_sf = shortfall, shortfall * 2.0
+                for _ in range(50):
+                    mid_sf = (low_sf + high_sf) / 2.0
+                    tax_test = calculate_federal_income_tax(base_ord + mid_sf, 0.0, status, age=sim_age)
+                    after_tax_sf = mid_sf - (tax_test["total_tax"] - funding["tax"]["total_tax"])
+                    if after_tax_sf >= shortfall:
+                        high_sf = mid_sf
+                    else:
+                        low_sf = mid_sf
+                gross_sf = high_sf
+                tax_sf = gross_sf - shortfall
+                annual_gross_draw += gross_sf
+                annual_tax += tax_sf
+
+            annual_tax_rate = annual_tax / annual_gross_draw if annual_gross_draw > 0.0 else 0.0
+
+            for monthly_need in year_group["_spending"]:
+                if year_spending_total > 1e-9:
+                    weight = max(0.0, float(monthly_need)) / year_spending_total
+                else:
+                    weight = 1.0 / num_months_in_year if num_months_in_year > 0 else 0.0
+
+                m_gross = annual_gross_draw * weight
+                m_tax = annual_tax * weight
+                m_aca = annual_aca * weight
+
+                gross_draws.append(m_gross)
+                taxes.append(m_tax)
+                aca_surcharges.append(m_aca)
+                tax_rates.append(annual_tax_rate)
+
+            # Monthly simulation of accounts
+            gross_factor = annual_gross_draw / year_spending_total if year_spending_total > 0.0 else 1.0
+            for idx in year_group["_orig_idx"]:
+                m_spend = float(spending_needs.iloc[idx])
+                m_gross = m_spend * gross_factor
+                w_rem = m_gross
+                for acc in working_accounts:
+                    if acc.total > 0.0:
+                        drawn = min(w_rem, acc.total)
+                        basis_drawn = acc.cost_basis * (drawn / acc.total)
+                        acc.total -= drawn
+                        acc.cost_basis = max(0.0, acc.cost_basis - basis_drawn)
+                        w_rem -= drawn
+                        if w_rem <= 1e-9:
+                            break
+                s_ret = float(stock_returns[idx])
+                b_ret = float(bond_returns[idx])
+                for acc in working_accounts:
+                    if acc.asset_type == "equity":
+                        acc.total *= s_ret
+                    else:
+                        acc.total *= b_ret
+
+                if track_taxable_balances and taxable_balances is not None:
+                    taxable_balances.append(_taxable_account_balance(working_accounts))
+
+            if target_stock_pct is not None:
+                working_accounts = rebalance_retirement_accounts(working_accounts, target_stock_pct)["accounts"]
+
+        enriched[f"{prefix}Tax_Paid"] = taxes
+        enriched[f"{prefix}ACA_Surcharge"] = aca_surcharges
+        enriched[f"{prefix}Tax_Inclusive_Withdrawal"] = gross_draws
+        enriched[f"{prefix}Tax_Rate"] = tax_rates
+        if track_taxable_balances and taxable_balances is not None:
+            enriched["Taxable_Accounts_Balance"] = taxable_balances
+    return enriched
+
+
+def summarize_tax_metrics_from_results(
+    results_df: pd.DataFrame,
+    prefix: str = "",
+    initial_portfolio: float | None = None,
+    current_age: float | None = None,
+) -> dict[str, float | int | None]:
+    """Compute lifetime tax and ACA summary metrics for one strategy path."""
+
+    tax_col = f"{prefix}Tax_Paid"
+    aca_col = f"{prefix}ACA_Surcharge"
+    gross_col = f"{prefix}Tax_Inclusive_Withdrawal"
+    if tax_col not in results_df.columns or results_df.empty:
+        return {}
+
+    total_tax_and_aca = float(pd.to_numeric(results_df[tax_col], errors="coerce").fillna(0.0).sum())
+    total_aca = float(pd.to_numeric(results_df.get(aca_col, 0.0), errors="coerce").fillna(0.0).sum())
+    total_federal_tax = total_tax_and_aca - total_aca
+    total_gross = float(pd.to_numeric(results_df.get(gross_col, 0.0), errors="coerce").fillna(0.0).sum())
+
+    lifetime_tax_rate = total_tax_and_aca / total_gross if total_gross > 0.0 else 0.0
+
+    if initial_portfolio is None:
+        if "Portfolio_Value" in results_df.columns:
+            withdrawal = float(results_df.get("Withdrawal", pd.Series([0.0])).iloc[0])
+            initial_portfolio = float(results_df["Portfolio_Value"].iloc[0]) + withdrawal
+        else:
+            initial_portfolio = None
+
+    num_years = 1
+    if "Date" in results_df.columns:
+        num_years = max(1, len(pd.to_datetime(results_df["Date"]).dt.year.unique()))
+
+    avg_annual_tax_pct = (
+        (total_tax_and_aca / num_years) / float(initial_portfolio)
+        if initial_portfolio is not None and initial_portfolio > 0.0
+        else None
+    )
+
+    pre65_subsidized = 0
+    pre65_cliff = 0
+    medicare_transition_year: int | None = None
+    pre65_lifetime_tax_rate: float | None = None
+    pre65_avg_annual_tax_pct: float | None = None
+    if "Date" in results_df.columns and current_age is not None:
+        dates = pd.to_datetime(results_df["Date"])
+        start_year = int(dates.iloc[0].year)
+        start_month = int(dates.iloc[0].month)
+        months_elapsed = (dates.dt.year - start_year) * 12 + (dates.dt.month - start_month)
+        ages = float(current_age) + months_elapsed / 12.0
+        pre65_mask = ages < 65.0
+        if pre65_mask.any():
+            pre65_tax_and_aca = float(
+                pd.to_numeric(results_df.loc[pre65_mask, tax_col], errors="coerce").fillna(0.0).sum()
+            )
+            pre65_gross = float(
+                pd.to_numeric(results_df.loc[pre65_mask, gross_col], errors="coerce").fillna(0.0).sum()
+            )
+            pre65_lifetime_tax_rate = (
+                pre65_tax_and_aca / pre65_gross if pre65_gross > 0.0 else 0.0
+            )
+            if initial_portfolio is not None and initial_portfolio > 0.0:
+                pre65_years = max(1, len(dates.loc[pre65_mask].dt.year.unique()))
+                pre65_avg_annual_tax_pct = (
+                    (pre65_tax_and_aca / pre65_years) / float(initial_portfolio)
+                )
+
+        if aca_col in results_df.columns:
+            annual_aca = pd.DataFrame({
+                "Year": dates.dt.year,
+                "ACA_Surcharge": pd.to_numeric(results_df[aca_col], errors="coerce").fillna(0.0),
+            }).groupby("Year", as_index=False)["ACA_Surcharge"].sum()
+
+            for _, year_row in annual_aca.iterrows():
+                year = int(year_row["Year"])
+                age = float(current_age) + (year - start_year)
+                aca_amount = float(year_row["ACA_Surcharge"])
+                if age < 65.0:
+                    if aca_amount <= 0.0:
+                        pre65_subsidized += 1
+                    else:
+                        pre65_cliff += 1
+                elif medicare_transition_year is None and aca_amount <= 0.0:
+                    medicare_transition_year = year
+
+    min_actual_wd = float(pd.to_numeric(results_df[gross_col], errors="coerce").min() * 12.0) if gross_col in results_df.columns and not results_df.empty else None
+    max_actual_wd = float(pd.to_numeric(results_df[gross_col], errors="coerce").max() * 12.0) if gross_col in results_df.columns and not results_df.empty else None
+    median_actual_wd = float(pd.to_numeric(results_df[gross_col], errors="coerce").median() * 12.0) if gross_col in results_df.columns and not results_df.empty else None
+    avg_actual_wd = float(pd.to_numeric(results_df[gross_col], errors="coerce").mean() * 12.0) if gross_col in results_df.columns and not results_df.empty else None
+
+    return {
+        "Total_Tax_Paid": total_federal_tax,
+        "Total_ACA_Surcharge": total_aca,
+        "Total_Gross_Withdrawal": total_gross,
+        "Lifetime_Tax_Rate": lifetime_tax_rate,
+        "Pre65_Lifetime_Tax_Rate": pre65_lifetime_tax_rate,
+        "Avg_Annual_Tax_Pct": avg_annual_tax_pct,
+        "Pre65_Avg_Annual_Tax_Pct": pre65_avg_annual_tax_pct,
+        "Pre65_Subsidized_Years": pre65_subsidized,
+        "Pre65_Cliff_Years": pre65_cliff,
+        "Medicare_Transition_Year": medicare_transition_year,
+        "Min_Actual_Withdrawal": min_actual_wd,
+        "Max_Actual_Withdrawal": max_actual_wd,
+        "Median_Actual_Withdrawal": median_actual_wd,
+        "Average_Actual_Withdrawal": avg_actual_wd,
+    }
+
+
+TAX_SUMMARY_METRIC_KEYS = (
+    "Total_Tax_Paid",
+    "Total_ACA_Surcharge",
+    "Total_Gross_Withdrawal",
+    "Lifetime_Tax_Rate",
+    "Pre65_Lifetime_Tax_Rate",
+    "Avg_Annual_Tax_Pct",
+    "Pre65_Avg_Annual_Tax_Pct",
+    "Pre65_Subsidized_Years",
+    "Pre65_Cliff_Years",
+    "Medicare_Transition_Year",
+    "Min_Actual_Withdrawal",
+    "Max_Actual_Withdrawal",
+    "Median_Actual_Withdrawal",
+    "Average_Actual_Withdrawal",
+)
+
+TAX_SUMMARY_STRATEGY_PREFIXES = ("", "Fixed_", "CAPE_", "VPW_")
+
+
+def apply_strategy_tax_summaries_to_row(
+    row: dict,
+    enriched_results: pd.DataFrame,
+    initial_portfolio: float,
+    current_age: float | None,
+) -> None:
+    """Attach per-strategy lifetime tax and ACA summary metrics to one historical row."""
+
+    for prefix in TAX_SUMMARY_STRATEGY_PREFIXES:
+        tax_col = f"{prefix}Tax_Paid"
+        if tax_col not in enriched_results.columns:
+            continue
+        try:
+            summary = summarize_tax_metrics_from_results(
+                enriched_results,
+                prefix=prefix,
+                initial_portfolio=initial_portfolio,
+                current_age=current_age,
+            )
+        except (ValueError, TypeError):
+            summary = {}
+        for key in TAX_SUMMARY_METRIC_KEYS:
+            col_name = f"{prefix}{key}" if prefix else key
+            row[col_name] = summary.get(key)
 
 
 @dataclass
@@ -945,7 +1881,7 @@ def get_guardrail_withdrawals(
             'Portfolio_Value': current_portfolio_value,
             'Fixed_SR_Value': fixed_portfolio_value,
             'Fixed_SR_Withdrawal': fixed_actual_withdrawal,
-            'Fixed_SR_Total_Spending': fixed_total_spending,
+            'Fixed_SR_Total_Spending': 0.0 if fixed_depleted else fixed_total_spending,
             'CAPE_Value': cape_portfolio_value,
             'CAPE_Withdrawal': cape_actual_withdrawal,
             'CAPE_Total_Spending': cape_monthly_spending,
@@ -1068,7 +2004,6 @@ def _withdrawal_stats_from_results(results_df: pd.DataFrame) -> dict:
         "median_withdrawal": float(withdrawal.median()),
         "avg_withdrawal": float(withdrawal.mean()),
     }
-
 
 def simulate_fixed_withdrawal_retirement(
     df: pd.DataFrame,
@@ -1269,6 +2204,27 @@ def _run_single_retirement_task(start, context_spec: HistoricalWorkerContext | N
         row["VPW_Average_Actual_Withdrawal"] = None
         row["VPW_Median_Actual_Withdrawal"] = None
         row["VPW_Pct_Below_Fixed"] = None
+
+    if settings.accounts or settings.mode in ("Taxable Mode", "Taxable Historical Mode"):
+        try:
+            normalized_accounts = normalize_accounts(settings.accounts)
+            enriched_results = add_tax_metrics_to_withdrawal_results(
+                results_df,
+                normalized_accounts,
+                settings.marital_status,
+                settings.current_age,
+                target_stock_pct=settings.stock_pct,
+                market_data=df,
+            )
+            row.update(_withdrawal_stats_from_results(enriched_results))
+            apply_strategy_tax_summaries_to_row(
+                row,
+                enriched_results,
+                initial_portfolio=float(settings.initial_value),
+                current_age=settings.current_age,
+            )
+        except (ValueError, TypeError):
+            pass
 
     return row
 
