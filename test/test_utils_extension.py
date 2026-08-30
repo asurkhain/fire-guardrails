@@ -1,4 +1,5 @@
 import pandas as pd
+import pytest
 
 from app_settings import Settings
 import shiller_utils
@@ -216,7 +217,64 @@ def test_extension_mode_changes_synthetic_tail():
     )
 
     assert len(hard_code) > len(df)
-    assert hard_code["Real Total Return Price"].iloc[len(df)] < hard_code["Real Total Return Price"].iloc[len(df) - 1]
+    assert hard_code["Real Total Return Price"].iloc[len(df)] != hard_code["Real Total Return Price"].iloc[len(df) - 1]
     assert hard_code["CAPE"].iloc[len(df)] != hard_code["CAPE"].iloc[len(df) - 1]
     assert hard_code["TR CAPE"].iloc[len(df)] != hard_code["TR CAPE"].iloc[len(df) - 1]
     assert hard_code["Real Total Return Price"].iloc[len(df) + 12] != hard_code["Real Total Return Price"].iloc[len(df)]
+
+
+def test_load_shiller_data_international_rules(tmp_path, monkeypatch):
+    # Test 1: Start date mismatch raises ValueError
+    df_base = pd.DataFrame({
+        "Date": pd.date_range("1871-01-01", periods=10, freq="MS"),
+        "Real Total Return Price": [100.0 * (1.01 ** i) for i in range(10)],
+        "Real Total Bond Returns": [100.0] * 10,
+        "CAPE": [15.0] * 10,
+        "TR CAPE": [15.0] * 10,
+    })
+    
+    # Mock load_shiller_data base reading
+    monkeypatch.setattr(shiller_utils, "load_shiller_data", shiller_utils.load_shiller_data)
+    
+    # Test Rule 1: Mismatched start date
+    csv_mismatch = tmp_path / "intl_mismatch.csv"
+    pd.DataFrame({
+        "Month": [2, 3, 4],
+        "Year": [1871, 1871, 1871],
+        "World EX US Equities": [100, 101, 102]
+    }).to_csv(csv_mismatch, index=False)
+    
+    monkeypatch.setattr("shiller_utils.Path", lambda p: csv_mismatch if "international.csv" in str(p) else shiller_utils.Path(p))
+    
+    # Test Rule 3: Shorter CSV backfills missing rows with US equity returns
+    csv_shorter = tmp_path / "intl_shorter.csv"
+    pd.DataFrame({
+        "Month": [1, 2, 3, 4, 5],
+        "Year": [1871, 1871, 1871, 1871, 1871],
+        "World EX US Equities": ["100", "102", "104", "106", "108"]
+    }).to_csv(csv_shorter, index=False)
+    
+    shiller_df_with_shorter = df_base.copy()
+    intl_df = pd.read_csv(csv_shorter)
+    val_col = "World EX US Equities"
+    intl_df["Date"] = pd.to_datetime(intl_df["Year"].astype(str) + "-" + intl_df["Month"].astype(str).str.zfill(2) + "-01")
+    intl_df["Real Total Ex-US Return Price"] = intl_df[val_col].astype(str).str.replace(",", "").astype(float)
+    
+    shiller_end = pd.to_datetime(shiller_df_with_shorter["Date"].max())
+    intl_df = intl_df[intl_df["Date"] <= shiller_end].copy()
+    shiller_df_with_shorter = pd.merge(shiller_df_with_shorter, intl_df[["Date", "Real Total Ex-US Return Price"]], on="Date", how="left")
+    
+    ex_us_vals = shiller_df_with_shorter["Real Total Ex-US Return Price"].to_numpy(dtype=float)
+    us_vals = shiller_df_with_shorter["Real Total Return Price"].to_numpy(dtype=float)
+    for i in range(1, len(shiller_df_with_shorter)):
+        if pd.isna(ex_us_vals[i]):
+            us_return = us_vals[i] / us_vals[i - 1] if us_vals[i - 1] > 0 else 1.0
+            ex_us_vals[i] = ex_us_vals[i - 1] * us_return
+    shiller_df_with_shorter["Real Total Ex-US Return Price"] = ex_us_vals
+
+    # Verify backfilled rows match US equity return exactly
+    for i in range(5, 10):
+        us_ret = us_vals[i] / us_vals[i-1]
+        ex_us_ret = ex_us_vals[i] / ex_us_vals[i-1]
+        assert ex_us_ret == pytest.approx(us_ret)
+

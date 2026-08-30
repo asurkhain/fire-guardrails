@@ -18,7 +18,7 @@ RECURRING_CASHFLOWS_FILENAME = "recurring_cashflows.csv"
 RECURRING_CASHFLOW_COLUMNS = ("label", "start_month", "end_month", "amount")
 TAXABLE_ACCOUNTS_DRAFT_KEY = "taxable_mode_accounts_draft"
 VALID_ACCOUNT_TYPES = ("taxable", "retirement pretax", "retirement post tax")
-VALID_ASSET_TYPES = ("equity", "bond")
+VALID_ASSET_TYPES = ("equity", "equity ex-US", "bond")
 DEFAULT_TAXABLE_MODE_ACCOUNTS = [
     {
         "account_type": "taxable",
@@ -721,7 +721,6 @@ def accounts_records_from_editor(
 def init_taxable_accounts_widget_state() -> None:
     """Initialize committed and draft account tables in session state."""
 
-    st.session_state.pop("taxable_mode_accounts_editor", None)
     if "taxable_mode_accounts" not in st.session_state:
         st.session_state["taxable_mode_accounts"] = default_starting_accounts()
     if TAXABLE_ACCOUNTS_DRAFT_KEY not in st.session_state:
@@ -742,6 +741,7 @@ def commit_taxable_accounts_from_editor(editor_state) -> tuple[bool, str]:
     committed_df = pd.DataFrame(records)
     st.session_state["taxable_mode_accounts"] = records
     st.session_state[TAXABLE_ACCOUNTS_DRAFT_KEY] = committed_df
+    st.session_state.pop("taxable_mode_accounts_editor", None)
     save_starting_accounts_to_csv(records)
     return True, f"Saved {len(records)} account row(s)."
 

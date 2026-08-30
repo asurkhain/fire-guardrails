@@ -70,6 +70,7 @@ def test_historical_worker_task_lazily_initializes_context(monkeypatch):
             "Withdrawal": [100.0],
             "Portfolio_Value": [900.0],
             "Total_Spending": [120.0],
+            "Guardrail_Success": [True],
         }
     )
 

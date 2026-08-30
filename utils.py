@@ -1131,6 +1131,19 @@ def simulate_fixed_withdrawal_retirement(
     return {"success": not depleted, "ending_value": ending_value}
 
 
+def is_successful_ending_value(ending_value: float) -> tuple[bool, float]:
+    val = max(0.0, float(ending_value))
+    return float(ending_value) >= 0.0, val
+
+
+def _guardrail_run_success(results_df: pd.DataFrame, final_value_target: float = 0.0) -> tuple[bool, float]:
+    if results_df.empty:
+        return False, 0.0
+    ending_value = max(results_df["Portfolio_Value"].iloc[-1], 0.0)
+    return results_df["Guardrail_Success"].iloc[-1] and ending_value >= final_value_target, ending_value
+
+
+
 def _run_single_retirement_task(start, context_spec: HistoricalWorkerContext | None = None) -> dict:
     """Run a single historical retirement simulation."""
     context = _HISTORICAL_WORKER_CONTEXT
@@ -1163,7 +1176,7 @@ def _run_single_retirement_task(start, context_spec: HistoricalWorkerContext | N
     withdrawal_stats = _withdrawal_stats_from_results(results_df)
 
     ending_value = max(results_df["Portfolio_Value"].iloc[-1], 0.0)
-    success = results_df["Guardrail_Success"].iloc[-1]
+    success = bool(results_df["Guardrail_Success"].iloc[-1])
     end_date = period_settings.retirement_end_date()
 
     initial_monthly = float(period_settings.initial_monthly_spending)
