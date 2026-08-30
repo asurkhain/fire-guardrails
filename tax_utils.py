@@ -80,9 +80,13 @@ def _canonical_account_type(account_type: str) -> str:
 
 def _canonical_asset_type(asset_type: str) -> str:
     value = str(asset_type).strip().lower()
-    if value not in ("equity", "bond"):
-        raise ValueError("Asset type must be equity or bond.")
-    return value
+    if value in ("equity ex-us", "equity ex us", "equity_ex_us", "ex_us", "ex-us"):
+        return "equity ex-US"
+    if value in ("equity", "stock", "stocks"):
+        return "equity"
+    if value in ("bond", "bonds"):
+        return "bond"
+    raise ValueError("Asset type must be equity, equity ex-US, or bond.")
 
 
 def normalize_accounts(accounts: Iterable[PortfolioAccount | Mapping[str, Any]]) -> list[PortfolioAccount]:
@@ -161,6 +165,7 @@ def apply_account_return_multipliers(
     accounts: Iterable[PortfolioAccount | Mapping[str, Any]],
     equity_return_multiplier: float,
     bond_return_multiplier: float,
+    ex_us_equity_return_multiplier: float = 1.0,
 ) -> dict[str, Any]:
     """Apply one period's market returns and recognize taxable-bond income.
 
@@ -171,9 +176,15 @@ def apply_account_return_multipliers(
 
     equity_multiplier = max(0.0, float(equity_return_multiplier))
     bond_multiplier = max(0.0, float(bond_return_multiplier))
+    ex_us_equity_multiplier = max(0.0, float(ex_us_equity_return_multiplier))
     updated_accounts = normalize_accounts(accounts)
     for account in updated_accounts:
-        multiplier = equity_multiplier if account.asset_type == "equity" else bond_multiplier
+        if account.asset_type == "equity":
+            multiplier = equity_multiplier
+        elif account.asset_type == "equity ex-US":
+            multiplier = ex_us_equity_multiplier
+        else:
+            multiplier = bond_multiplier
         account.total *= multiplier
     return settle_taxable_bond_gains(updated_accounts)
 
@@ -194,7 +205,7 @@ def rebalance_retirement_accounts(
         raise ValueError("Target stock percentage must be between 0 and 1.")
     working_accounts = normalize_accounts(accounts)
     total_value = sum(account.total for account in working_accounts)
-    current_equity = sum(account.total for account in working_accounts if account.asset_type == "equity")
+    current_equity = sum(account.total for account in working_accounts if account.asset_type in ("equity", "equity ex-US"))
     target_equity = total_value * target_stock_pct
     amount_to_reclassify = abs(target_equity - current_equity)
     target_asset = "equity" if target_equity > current_equity else "bond"
@@ -259,7 +270,7 @@ def rebalance_retirement_accounts(
             break
 
     working_accounts = [account for account in working_accounts if account.total > 1e-9]
-    achieved_equity = sum(account.total for account in working_accounts if account.asset_type == "equity")
+    achieved_equity = sum(account.total for account in working_accounts if account.asset_type in ("equity", "equity ex-US"))
     return {
         "accounts": working_accounts,
         "rebalanced_amount": amount_to_reclassify - remaining,
@@ -366,7 +377,7 @@ def _withdraw_from_account(account: PortfolioAccount, amount: float, phase: str)
     ordinary_income = 0.0
     long_term_capital_gains = 0.0
     if account.account_type == "taxable" and account.total > 0.0:
-        if account.asset_type == "equity":
+        if account.asset_type in ("equity", "equity ex-US"):
             realized_gain = amount * gain / account.total
             long_term_capital_gains = realized_gain
             account.cost_basis = max(0.0, account.cost_basis - (amount - realized_gain))
@@ -437,9 +448,9 @@ def allocate_account_withdrawal(
     for account in working_accounts:
         if remaining <= 1e-9 or remaining_fpl_income <= 1e-9:
             break
-        if account.account_type != "taxable" or account.asset_type != "equity" or account.total <= 0.0:
+        if account.account_type != "taxable" or account.asset_type not in ("equity", "equity ex-US") or account.total <= 0.0:
             continue
-        gain_ratio = max(account.total - account.cost_basis, 0.0) / account.total
+        gain_ratio = (max(account.total - account.cost_basis, 0.0) / account.total) if account.total > 0.0 else 0.0
         maximum_equity_draw = account.total if gain_ratio <= 0.0 else remaining_fpl_income / gain_ratio
         transaction = _withdraw_from_account(
             account,
@@ -483,7 +494,7 @@ def allocate_account_withdrawal(
     for account in working_accounts:
         if remaining <= 1e-9:
             break
-        if account.account_type == "taxable" and account.asset_type == "equity":
+        if account.account_type == "taxable" and account.asset_type in ("equity", "equity ex-US"):
             transaction = _withdraw_from_account(account, min(remaining, account.total), "taxable_equity_after_fpl_limit")
             if transaction:
                 transactions.append(transaction)
@@ -568,8 +579,18 @@ def fund_spending_with_tax(
         )
 
     def result_for(draw: float) -> dict[str, Any]:
+        working = [
+            PortfolioAccount(
+                account_type=a.account_type,
+                asset_type=a.asset_type,
+                cost_basis=a.cost_basis,
+                total=a.total,
+                account_id=a.account_id,
+            )
+            for a in source_accounts
+        ]
         allocation = allocate_account_withdrawal(
-            source_accounts,
+            working,
             draw,
             fpl_income_limit=fpl_income_limit,
         )
@@ -656,12 +677,16 @@ def add_tax_metrics_to_withdrawal_results(
     # Pre-calculate monthly market returns if market_data is provided
     stock_returns: np.ndarray = np.ones(len(enriched))
     bond_returns: np.ndarray = np.ones(len(enriched))
+    ex_us_returns: np.ndarray = np.ones(len(enriched))
     if market_data is not None and not market_data.empty:
         m_df = market_data.copy()
         m_df["Date"] = pd.to_datetime(m_df["Date"])
+        cols = ["Date", "Real Total Return Price", "Real Total Bond Returns"]
+        if "Real Total Ex-US Return Price" in m_df.columns:
+            cols.append("Real Total Ex-US Return Price")
         merged = pd.merge(
             enriched[["Date"]].copy(),
-            m_df[["Date", "Real Total Return Price", "Real Total Bond Returns"]],
+            m_df[cols],
             on="Date",
             how="left"
         )
@@ -670,6 +695,10 @@ def add_tax_metrics_to_withdrawal_results(
         if len(s_prices) > 1:
             stock_returns[:-1] = np.where(s_prices[:-1] > 0.0, s_prices[1:] / s_prices[:-1], 1.0)
             bond_returns[:-1] = np.where(b_prices[:-1] > 0.0, b_prices[1:] / b_prices[:-1], 1.0)
+        if "Real Total Ex-US Return Price" in merged.columns:
+            ex_prices = merged["Real Total Ex-US Return Price"].ffill().bfill().to_numpy(dtype=float)
+            if len(ex_prices) > 1:
+                ex_us_returns[:-1] = np.where(ex_prices[:-1] > 0.0, ex_prices[1:] / ex_prices[:-1], 1.0)
 
     strategies = (
         ("", "Withdrawal", "Total_Spending"),
@@ -713,38 +742,25 @@ def add_tax_metrics_to_withdrawal_results(
             year_cashflow_total = float(year_group["_cashflow"].sum())
             sim_age = None if current_age is None else float(current_age) + (int(year) - start_year)
 
-            funding = fund_spending_with_tax(
-                working_accounts,
-                year_spending_total,
-                marital_status,
-                other_ordinary_income=year_cashflow_total,
-                current_age=sim_age,
-                target_stock_pct=target_stock_pct,
-            )
+            if year_spending_total <= 1e-9:
+                annual_tax = 0.0
+                annual_aca = 0.0
+                annual_gross_draw = 0.0
+                annual_tax_rate = 0.0
+            else:
+                funding = fund_spending_with_tax(
+                    working_accounts,
+                    year_spending_total,
+                    marital_status,
+                    other_ordinary_income=year_cashflow_total,
+                    current_age=sim_age,
+                    target_stock_pct=target_stock_pct,
+                )
 
-            annual_tax = float(funding["tax"]["total_tax_and_fpl_health_expense"])
-            annual_aca = float(funding["tax"]["fpl_health_expense"])
-            annual_gross_draw = float(funding["gross_withdrawal"])
-            shortfall = float(funding.get("spending_shortfall", 0.0))
-
-            if shortfall > 1e-6:
-                base_ord = float(funding["tax"]["modified_adjusted_gross_income"])
-                status = _canonical_marital_status(marital_status)
-                low_sf, high_sf = shortfall, shortfall * 2.0
-                for _ in range(50):
-                    mid_sf = (low_sf + high_sf) / 2.0
-                    tax_test = calculate_federal_income_tax(base_ord + mid_sf, 0.0, status, age=sim_age)
-                    after_tax_sf = mid_sf - (tax_test["total_tax"] - funding["tax"]["total_tax"])
-                    if after_tax_sf >= shortfall:
-                        high_sf = mid_sf
-                    else:
-                        low_sf = mid_sf
-                gross_sf = high_sf
-                tax_sf = gross_sf - shortfall
-                annual_gross_draw += gross_sf
-                annual_tax += tax_sf
-
-            annual_tax_rate = annual_tax / annual_gross_draw if annual_gross_draw > 0.0 else 0.0
+                annual_tax = float(funding["tax"]["total_tax"])
+                annual_aca = float(funding["tax"]["fpl_health_expense"])
+                annual_gross_draw = float(funding["gross_withdrawal"])
+                annual_tax_rate = annual_tax / annual_gross_draw if annual_gross_draw > 0.0 else 0.0
 
             for monthly_need in year_group["_spending"]:
                 if year_spending_total > 1e-9:
@@ -766,21 +782,15 @@ def add_tax_metrics_to_withdrawal_results(
             for idx in year_group["_orig_idx"]:
                 m_spend = float(spending_needs.iloc[idx])
                 m_gross = m_spend * gross_factor
-                w_rem = m_gross
-                for acc in working_accounts:
-                    if acc.total > 0.0:
-                        drawn = min(w_rem, acc.total)
-                        basis_drawn = acc.cost_basis * (drawn / acc.total)
-                        acc.total -= drawn
-                        acc.cost_basis = max(0.0, acc.cost_basis - basis_drawn)
-                        w_rem -= drawn
-                        if w_rem <= 1e-9:
-                            break
+                working_accounts = allocate_account_withdrawal(working_accounts, m_gross)["accounts"]
                 s_ret = float(stock_returns[idx])
                 b_ret = float(bond_returns[idx])
+                ex_us_ret = float(ex_us_returns[idx])
                 for acc in working_accounts:
                     if acc.asset_type == "equity":
                         acc.total *= s_ret
+                    elif acc.asset_type == "equity ex-US":
+                        acc.total *= ex_us_ret
                     else:
                         acc.total *= b_ret
 
@@ -813,12 +823,12 @@ def summarize_tax_metrics_from_results(
     if tax_col not in results_df.columns or results_df.empty:
         return {}
 
-    total_tax_and_aca = float(pd.to_numeric(results_df[tax_col], errors="coerce").fillna(0.0).sum())
+    total_federal_tax = float(pd.to_numeric(results_df[tax_col], errors="coerce").fillna(0.0).sum())
     total_aca = float(pd.to_numeric(results_df.get(aca_col, 0.0), errors="coerce").fillna(0.0).sum())
-    total_federal_tax = total_tax_and_aca - total_aca
+    total_tax_and_aca = total_federal_tax + total_aca
     total_gross = float(pd.to_numeric(results_df.get(gross_col, 0.0), errors="coerce").fillna(0.0).sum())
 
-    lifetime_tax_rate = total_tax_and_aca / total_gross if total_gross > 0.0 else 0.0
+    lifetime_tax_rate = total_federal_tax / total_gross if total_gross > 0.0 else 0.0
 
     if initial_portfolio is None:
         if "Portfolio_Value" in results_df.columns:

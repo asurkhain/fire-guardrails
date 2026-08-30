@@ -1605,6 +1605,10 @@ def render_historical_results(
             if starting_portfolio and fixed_yearly_withdrawal
             else "N/A"
         )
+
+        # fmt_mean_rate("Fixed_Median_Actual_Withdrawal"") if "Fixed_Median_Actual_Withdrawal" in results_df.columns else fixed_withdrawal_rate,
+        # results_df["Fixed_Median_Actual_Withdrawal"] if "Fixed_Median_Actual_Withdrawal" in results_df.columns else effective_fixed_yearly_withdrawal
+        # build_percentile_row("Fixed_Median_WD_Rate", "Fixed — Median Withdrawal Rate", is_pct=True),
         fixed_withdrawal_rate = (
             f"{effective_fixed_yearly_withdrawal / starting_portfolio:.2%}"
             if starting_portfolio and effective_fixed_yearly_withdrawal
@@ -1618,7 +1622,7 @@ def render_historical_results(
                 "Mean Avg Spend Rate": fixed_spend_rate,
                 "Mean Median Spend Rate": fixed_spend_rate,
                 "Mean Min Spend Rate": fixed_spend_rate,
-                "Mean Median Withdrawal Rate": fixed_withdrawal_rate,
+                "Mean Median Withdrawal Rate": fmt_mean_rate("Fixed_Median_Actual_Withdrawal") if "Fixed_Median_Actual_Withdrawal" in results_df.columns else fixed_withdrawal_rate,
                 "Mean Duration Below Initial": "N/A",
             }
         )

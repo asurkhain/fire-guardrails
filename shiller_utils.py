@@ -10,8 +10,9 @@ import requests
 # last_year, average_return, or hard_code_date
 SHILLER_EXTENSION_MODE = "hard_code_date"
 SHILLER_AVERAGE_RETURN_LOOKBACK_YEARS = 10
-SHILLER_HARD_CODE_DATE = pd.Timestamp("1965-01-01")
-#SHILLER_HARD_CODE_DATE = pd.Timestamp("2007-08-01")
+#SHILLER_HARD_CODE_DATE = pd.Timestamp("1965-01-01") # 61 years
+SHILLER_HARD_CODE_DATE = pd.Timestamp("2000-01-01") # 26 years
+#SHILLER_HARD_CODE_DATE = pd.Timestamp("2007-01-01") # 19 years
 
 
 def parse_shiller_date(series):
@@ -86,6 +87,12 @@ def extend_shiller_data_with_last_year(df: pd.DataFrame, extension_years: int) -
     cape_returns = cape_values[1:] / cape_values[:-1]
     tr_cape_returns = tr_cape_values[1:] / tr_cape_values[:-1]
 
+    has_ex_us = "Real Total Ex-US Return Price" in df_sorted.columns
+    if has_ex_us:
+        ex_us_prices = cycle_rows["Real Total Ex-US Return Price"].to_numpy(dtype=float)
+        ex_us_returns = np.where(ex_us_prices[:-1] > 0, ex_us_prices[1:] / ex_us_prices[:-1], 1.0)
+        current_ex_us = float(df_sorted["Real Total Ex-US Return Price"].iloc[-1])
+
     last_date = pd.to_datetime(df_sorted["Date"].iloc[-1])
     current_stock = float(df_sorted["Real Total Return Price"].iloc[-1])
     current_bond = float(df_sorted["Real Total Bond Returns"].iloc[-1])
@@ -98,6 +105,8 @@ def extend_shiller_data_with_last_year(df: pd.DataFrame, extension_years: int) -
         cycle_idx = month_idx % cycle_len
         current_stock *= float(stock_returns[cycle_idx])
         current_bond *= float(bond_returns[cycle_idx])
+        if has_ex_us:
+            current_ex_us *= float(ex_us_returns[cycle_idx])
 
         row = template_rows.iloc[cycle_idx].copy()
         row["Date"] = last_date + pd.DateOffset(months=month_idx + 1)
@@ -105,6 +114,8 @@ def extend_shiller_data_with_last_year(df: pd.DataFrame, extension_years: int) -
         row["Real Total Bond Returns"] = current_bond
         row["CAPE"] = current_cape
         row["TR CAPE"] = current_tr_cape
+        if has_ex_us:
+            row["Real Total Ex-US Return Price"] = current_ex_us
         future_rows.append(row)
 
     if not future_rows:
@@ -146,6 +157,13 @@ def extend_shiller_data_with_average_return(
     stock_factor = float(np.nanmean(stock_returns))
     bond_factor = float(np.nanmean(bond_returns))
 
+    has_ex_us = "Real Total Ex-US Return Price" in df_sorted.columns
+    if has_ex_us:
+        ex_us_prices = lookback_rows["Real Total Ex-US Return Price"].to_numpy(dtype=float)
+        ex_us_returns = np.where(ex_us_prices[:-1] > 0, ex_us_prices[1:] / ex_us_prices[:-1], 1.0)
+        ex_us_factor = float(np.nanmean(ex_us_returns))
+        current_ex_us = float(df_sorted["Real Total Ex-US Return Price"].iloc[-1])
+
     last_date = pd.to_datetime(df_sorted["Date"].iloc[-1])
     current_stock = float(df_sorted["Real Total Return Price"].iloc[-1])
     current_bond = float(df_sorted["Real Total Bond Returns"].iloc[-1])
@@ -156,6 +174,8 @@ def extend_shiller_data_with_average_return(
     for month_idx in range(future_months):
         current_stock *= stock_factor
         current_bond *= bond_factor
+        if has_ex_us:
+            current_ex_us *= ex_us_factor
 
         row = df_sorted.iloc[-1].copy()
         row["Date"] = last_date + pd.DateOffset(months=month_idx + 1)
@@ -163,6 +183,8 @@ def extend_shiller_data_with_average_return(
         row["Real Total Bond Returns"] = current_bond
         row["CAPE"] = cape_average
         row["TR CAPE"] = tr_cape_average
+        if has_ex_us:
+            row["Real Total Ex-US Return Price"] = current_ex_us
         future_rows.append(row)
 
     future_df = pd.DataFrame(future_rows)
@@ -207,6 +229,12 @@ def extend_shiller_data_with_hard_code_date(df: pd.DataFrame, extension_years: i
     cape_returns = cape_values[1:] / cape_values[:-1]
     tr_cape_returns = tr_cape_values[1:] / tr_cape_values[:-1]
 
+    has_ex_us = "Real Total Ex-US Return Price" in df_sorted.columns
+    if has_ex_us:
+        ex_us_prices = cycle_rows["Real Total Ex-US Return Price"].to_numpy(dtype=float)
+        ex_us_returns = np.where(ex_us_prices[:-1] > 0, ex_us_prices[1:] / ex_us_prices[:-1], 1.0)
+        current_ex_us = float(df_sorted["Real Total Ex-US Return Price"].iloc[-1])
+
     last_date = pd.to_datetime(df_sorted["Date"].iloc[-1])
     current_stock = float(df_sorted["Real Total Return Price"].iloc[-1])
     current_bond = float(df_sorted["Real Total Bond Returns"].iloc[-1])
@@ -221,6 +249,8 @@ def extend_shiller_data_with_hard_code_date(df: pd.DataFrame, extension_years: i
         current_bond *= float(bond_returns[cycle_idx])
         current_cape *= float(cape_returns[cycle_idx])
         current_tr_cape *= float(tr_cape_returns[cycle_idx])
+        if has_ex_us:
+            current_ex_us *= float(ex_us_returns[cycle_idx])
 
         row = template_rows.iloc[cycle_idx].copy()
         row["Date"] = last_date + pd.DateOffset(months=month_idx + 1)
@@ -228,6 +258,8 @@ def extend_shiller_data_with_hard_code_date(df: pd.DataFrame, extension_years: i
         row["Real Total Bond Returns"] = current_bond
         row["CAPE"] = current_cape
         row["TR CAPE"] = current_tr_cape
+        if has_ex_us:
+            row["Real Total Ex-US Return Price"] = current_ex_us
         future_rows.append(row)
 
     future_df = pd.DataFrame(future_rows)
@@ -346,16 +378,14 @@ def load_shiller_data():
     )
 
     # Read the actual data (starting row 8)
-    df = pd.read_excel(local_path, sheet_name="Data", skiprows=8)
+    df = pd.read_excel(local_path, sheet_name="Data", skiprows=8, header=None)
     df.columns = headers
     df = df.loc[:, [str(col).strip() != "" for col in df.columns]].copy()
     df = df.loc[:, ~df.columns.duplicated()].copy()
 
-    # Drop the last row which contains footnotes
-    df = df.iloc[:-1].reset_index(drop=True)
-
-    # TEMPORARY: Also drop the second to last row which as of 20251004 is a duplicate
-    #df = df.iloc[:-1].reset_index(drop=True)
+    # Drop non-data rows (footnotes / blank trailing rows)
+    df = df.dropna(subset=["Date"]).copy()
+    df = df[df["Date"].astype(str).str.contains(r"\.")].reset_index(drop=True)
 
     df = df.rename(columns={
         "Earnings Ratio P/E10 or CAPE": "CAPE",
@@ -372,4 +402,41 @@ def load_shiller_data():
     df = _fill_missing_cape_values(df)
 
     df["Date"] = parse_shiller_date(df["Date"])
+
+    intl_path = Path(os.path.join("tempdir", "international.csv"))
+    if intl_path.exists():
+        intl_df = pd.read_csv(intl_path)
+        if {"Month", "Year"}.issubset(intl_df.columns):
+            val_col = [c for c in intl_df.columns if c not in ("Month", "Year")][0]
+            intl_df["Date"] = pd.to_datetime(
+                intl_df["Year"].astype(str) + "-" + intl_df["Month"].astype(str).str.zfill(2) + "-01"
+            )
+            intl_df["Real Total Ex-US Return Price"] = (
+                intl_df[val_col].astype(str).str.replace(",", "").astype(float)
+            )
+            intl_df = intl_df.sort_values("Date").reset_index(drop=True)
+
+            shiller_start = pd.to_datetime(df["Date"].iloc[0])
+            intl_start = intl_df["Date"].iloc[0]
+            if intl_start.year != shiller_start.year or intl_start.month != shiller_start.month:
+                raise ValueError(
+                    f"First row of international.csv ({intl_start.strftime('%Y-%m')}) "
+                    f"does not match Shiller start date ({shiller_start.strftime('%Y-%m')})."
+                )
+
+            shiller_end = pd.to_datetime(df["Date"].max())
+            intl_df = intl_df[intl_df["Date"] <= shiller_end].copy()
+
+            df = pd.merge(df, intl_df[["Date", "Real Total Ex-US Return Price"]], on="Date", how="left")
+            ex_us_col = "Real Total Ex-US Return Price"
+            us_col = "Real Total Return Price"
+            if ex_us_col in df.columns:
+                ex_us_vals = df[ex_us_col].to_numpy(dtype=float)
+                us_vals = df[us_col].to_numpy(dtype=float)
+                for i in range(1, len(df)):
+                    if np.isnan(ex_us_vals[i]):
+                        us_return = us_vals[i] / us_vals[i - 1] if us_vals[i - 1] > 0 else 1.0
+                        ex_us_vals[i] = ex_us_vals[i - 1] * us_return
+                df[ex_us_col] = ex_us_vals
     return df
+

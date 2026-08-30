@@ -191,27 +191,27 @@ if st.runtime.exists():
                     required=True,
                 ),
                 "asset_type": st.column_config.SelectboxColumn(
-                    "Asset Type", options=["equity", "bond"], required=True,
+                    "Asset Type", options=["equity", "equity ex-US", "bond"], required=True,
                 ),
                 "cost_basis": st.column_config.NumberColumn("Cost Basis", min_value=0.0, format="$%.0f"),
                 "total": st.column_config.NumberColumn("Total", min_value=0.0, format="$%.0f"),
             },
             num_rows="dynamic",
             hide_index=True,
+            key="taxable_mode_accounts_editor",
         )
         apply_account_changes = st.sidebar.button(
             "Apply account changes",
             key="apply_taxable_accounts_btn",
         )
         if apply_account_changes:
-            saved, message = controls.commit_taxable_accounts_from_editor(edited_accounts_df)
+            editor_state = st.session_state.get("taxable_mode_accounts_editor", edited_accounts_df)
+            saved, message = controls.commit_taxable_accounts_from_editor(editor_state)
             if saved:
                 st.sidebar.success(message)
+                st.rerun()
             else:
                 st.sidebar.error(message)
-                st.session_state[controls.TAXABLE_ACCOUNTS_DRAFT_KEY] = edited_accounts_df
-        else:
-            st.session_state[controls.TAXABLE_ACCOUNTS_DRAFT_KEY] = edited_accounts_df
         taxable_accounts = st.session_state["taxable_mode_accounts"]
         try:
             normalized_accounts = tax_utils.normalize_accounts(taxable_accounts)

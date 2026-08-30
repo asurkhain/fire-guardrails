@@ -305,8 +305,8 @@ def test_tax_metrics_never_zeros_out_when_spending_is_active():
         "Date": pd.date_range("1968-01-01", periods=600, freq="MS"),
     })
     accounts = [
-        {"account_type": "taxable", "asset_type": "equity", "cost_basis": 1_057_000, "total": 3_014_000},
-        {"account_type": "retirement_pretax", "asset_type": "equity", "cost_basis": 657_000, "total": 657_000},
+        {"account_type": "taxable", "asset_type": "equity", "cost_basis": 1_057_000, "total": 10_000_000},
+        {"account_type": "retirement_pretax", "asset_type": "equity", "cost_basis": 657_000, "total": 5_000_000},
     ]
 
     enriched = add_tax_metrics_to_withdrawal_results(results, accounts, "single", 42)
@@ -389,7 +389,7 @@ def test_bond_basis_only_drawn_if_staying_under_fpl_cap():
 
 def test_summarize_tax_metrics_splits_federal_tax_and_aca_surcharge():
     results = pd.DataFrame({
-        "Tax_Paid": [5_000.0, 5_000.0],
+        "Tax_Paid": [4_000.0, 4_000.0],
         "ACA_Surcharge": [1_000.0, 1_000.0],
         "Tax_Inclusive_Withdrawal": [20_000.0, 20_000.0],
         "Portfolio_Value": [900_000.0, 880_000.0],
@@ -402,8 +402,8 @@ def test_summarize_tax_metrics_splits_federal_tax_and_aca_surcharge():
     assert summary["Total_Tax_Paid"] == pytest.approx(8_000.0)
     assert summary["Total_ACA_Surcharge"] == pytest.approx(2_000.0)
     assert summary["Total_Gross_Withdrawal"] == pytest.approx(40_000.0)
-    assert summary["Lifetime_Tax_Rate"] == pytest.approx(0.25)
-    assert summary["Pre65_Lifetime_Tax_Rate"] == pytest.approx(0.25)
+    assert summary["Lifetime_Tax_Rate"] == pytest.approx(0.20)
+    assert summary["Pre65_Lifetime_Tax_Rate"] == pytest.approx(0.20)
     assert summary["Avg_Annual_Tax_Pct"] == pytest.approx(0.005)
     assert summary["Pre65_Cliff_Years"] == 2
     assert summary["Pre65_Subsidized_Years"] == 0
@@ -558,3 +558,46 @@ def test_historical_taxable_worker_records_per_cohort_tax_metrics(monkeypatch):
         assert row[f"{prefix}Total_Tax_Paid"] > 0
         assert row[f"{prefix}Lifetime_Tax_Rate"] > 0
         assert row[f"{prefix}Avg_Annual_Tax_Pct"] > 0
+
+
+def test_equity_ex_us_canonicalization_and_return_multipliers():
+    accs = [
+        {"account_type": "taxable", "asset_type": "equity ex-US", "cost_basis": 100, "total": 100},
+        {"account_type": "taxable", "asset_type": "equity", "cost_basis": 100, "total": 100},
+        {"account_type": "taxable", "asset_type": "bond", "cost_basis": 100, "total": 100},
+    ]
+    res = apply_account_return_multipliers(
+        accounts=accs,
+        equity_return_multiplier=1.10,
+        bond_return_multiplier=1.02,
+        ex_us_equity_return_multiplier=1.05,
+    )
+    updated = {a.asset_type: a.total for a in res["accounts"]}
+    assert updated["equity ex-US"] == pytest.approx(105.0)
+    assert updated["equity"] == pytest.approx(110.0)
+    assert updated["bond"] == pytest.approx(102.0)
+
+
+def test_add_tax_metrics_with_equity_ex_us():
+    dates = pd.date_range("2020-01-01", periods=12, freq="MS")
+    results = pd.DataFrame({
+        "Date": dates,
+        "Withdrawal": [1000.0] * 12,
+        "Total_Spending": [1000.0] * 12,
+        "Net_Cashflow": [0.0] * 12,
+    })
+    accounts = [
+        {"account_type": "taxable", "asset_type": "equity ex-US", "cost_basis": 50000.0, "total": 100000.0},
+    ]
+    market_data = pd.DataFrame({
+        "Date": dates,
+        "Real Total Return Price": np.linspace(100.0, 110.0, 12),
+        "Real Total Bond Returns": np.linspace(100.0, 102.0, 12),
+        "Real Total Ex-US Return Price": np.linspace(100.0, 105.0, 12),
+    })
+    enriched = add_tax_metrics_to_withdrawal_results(
+        results, accounts, "single", 40, market_data=market_data
+    )
+    assert "Taxable_Accounts_Balance" in enriched.columns
+    assert float(enriched["Taxable_Accounts_Balance"].iloc[-1]) > 0
+
